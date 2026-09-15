@@ -1,0 +1,16 @@
+[package]
+name = "ctxtag-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ctx"
+path = "src/main.rs"
+
+[dependencies]
+ctxtag-core = { path = "../ctxtag-core" }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+anyhow = "1"

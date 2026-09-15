@@ -1,0 +1,73 @@
+# Vendor Setup Instructions
+
+Run these commands on a machine with internet access, then copy the resulting vendor/ directory to this project.
+
+## Step 1: Create temp project
+
+```bash
+mkdir /tmp/ctx-vendor && cd /tmp/ctx-vendor
+cargo init --name context-tag
+```
+
+## Step 2: Write Cargo.toml
+
+```bash
+cat > Cargo.toml << 'TOML'
+[package]
+name = "context-tag"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tree-sitter = "0.23"
+rusqlite = { version = "0.32", features = ["bundled", "fts5"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+walkdir = "2"
+sha2 = "0.10"
+regex = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+lsp-server = "0.7"
+lsp-types = "0.95"
+tokio = { version = "1", features = ["full"] }
+notify = "6"
+
+[build-dependencies]
+cc = "1"
+TOML
+```
+
+## Step 3: Generate vendor
+
+```bash
+cargo vendor ../vendor
+```
+
+## Step 4: Copy to project
+
+```bash
+cp -r /tmp/vendor /home/thomas/context-tag/
+```
+
+## Step 5: Enable vendor in project
+
+Edit /home/thomas/context-tag/.cargo/config.toml:
+
+```toml
+[source.crates-io]
+replace-with = "local-vendor"
+
+[source.local-vendor]
+directory = "vendor/"
+```
+
+## Step 6: Build
+
+```bash
+cd /home/thomas/context-tag
+cargo build --workspace
+```
