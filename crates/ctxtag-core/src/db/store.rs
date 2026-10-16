@@ -1,15 +1,108 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-
 use crate::model::{Include, Macro, Reference, Symbol};
 
-use super::schema::{create_schema, create_schema_no_index, create_indexes, drop_indexes};
+use super::schema::{
+    self, create_indexes, create_schema, create_schema_no_index, drop_indexes,
+};
 
+/// Compact, interned write/read store.
+///
+/// All identifier strings live once in the `strings` table; every other table
+/// references them by integer id. `str_cache` mirrors that mapping in memory so
+/// interning during a bulk index is a hash lookup, not a DB round-trip.
 pub struct DbStore {
     pub(crate) conn: rusqlite::Connection,
+    str_cache: HashMap<String, i64>,
 }
+
+/// Intern a string, returning its id. Uses an in-memory cache first, then a
+/// single UPSERT ... RETURNING statement so a miss costs one round-trip.
+fn intern(tx: &Transaction, cache: &mut HashMap<String, i64>, s: &str) -> anyhow::Result<i64> {
+    if let Some(&id) = cache.get(s) {
+        return Ok(id);
+    }
+    let id: i64 = tx.query_row(
+        "INSERT INTO strings(text) VALUES(?1) ON CONFLICT(text) DO UPDATE SET text=text RETURNING id",
+        params![s],
+        |r| r.get(0),
+    )?;
+    cache.insert(s.to_string(), id);
+    Ok(id)
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn hash_content(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn lang_from_path(path: &str) -> i64 {
+    match path.rsplit('.').next() {
+        Some("cpp") | Some("cxx") | Some("cc") | Some("hpp") | Some("hxx") | Some("hh") => {
+            schema::LANG_CPP
+        }
+        _ => schema::LANG_C,
+    }
+}
+
+fn lang_from_str(s: &str) -> i64 {
+    if s == "cpp" {
+        schema::LANG_CPP
+    } else {
+        schema::LANG_C
+    }
+}
+
+fn symbol_flags(sym: &Symbol) -> i64 {
+    let mut f = 0i64;
+    if sym.is_definition {
+        f |= schema::F_SYMBOL_IS_DEF;
+    }
+    if sym.is_virtual {
+        f |= schema::F_SYMBOL_VIRTUAL;
+    }
+    if sym.is_override {
+        f |= schema::F_SYMBOL_OVERRIDE;
+    }
+    if sym.is_final {
+        f |= schema::F_SYMBOL_FINAL;
+    }
+    if sym.is_const_method {
+        f |= schema::F_SYMBOL_CONST;
+    }
+    f
+}
+
+const INS_SYMBOL: &str = "INSERT INTO symbols (
+    name_id, qual_id, kind, flags, file_id,
+    line_start, line_end, col_start, col_end, sel_line, sel_col,
+    scope_kind, scope_depth, parent_id, container_id
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+
+const INS_REF: &str = "INSERT INTO refs (
+    name_id, file_id, line, col, end_line, end_col, kind, flags
+) VALUES (?,?,?,?,?,?,?,?)";
+
+const INS_CALL: &str =
+    "INSERT INTO call_edges (caller_id, callee_id, file_id, line, col) VALUES (?,?,?,?,?)";
+
+const INS_MACRO: &str =
+    "INSERT INTO macros (name_id, flags, params_id, body_id, file_id, line) VALUES (?,?,?,?,?,?)";
+
+const INS_INCLUDE: &str =
+    "INSERT INTO includes (from_file_id, to_file_id, line, flags) VALUES (?,?,?,?)";
+
+const INS_FTS: &str = "INSERT INTO symbols_fts(rowid, name) VALUES (?,?)";
 
 impl DbStore {
     pub fn new(db_path: &str) -> anyhow::Result<Self> {
@@ -18,36 +111,35 @@ impl DbStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "OFF")?;
         create_schema(&conn)?;
-        Ok(Self { conn: conn })
+        Ok(Self {
+            conn,
+            str_cache: HashMap::new(),
+        })
     }
 
-    /// Create a DbStore optimized for bulk import.
-    /// Uses aggressive pragmas (synchronous=OFF, large cache, 4KB pages)
-    /// and defers index creation until finalize_indexes() is called.
-    /// This strategy (Config C from profiling) yields ~1.7x speedup
-    /// by avoiding index maintenance during bulk inserts.
+    /// Bulk-import mode: aggressive pragmas, indexes deferred until
+    /// `finalize_indexes()`.
     pub fn new_bulk_mode(db_path: &str) -> anyhow::Result<Self> {
         let conn = rusqlite::Connection::open(db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "OFF")?;
         conn.pragma_update(None, "foreign_keys", "OFF")?;
-        conn.pragma_update(None, "cache_size", "500000")?;
-        conn.pragma_update(None, "page_size", "4096")?;
+        conn.pragma_update(None, "cache_size", "-1000000")?;
         conn.pragma_update(None, "temp_store", "memory")?;
         conn.pragma_update(None, "mmap_size", "2147483648")?;
         create_schema_no_index(&conn)?;
-        Ok(Self { conn: conn })
+        Ok(Self {
+            conn,
+            str_cache: HashMap::new(),
+        })
     }
 
-    /// Finalize the bulk import by building all indexes.
-    /// Must be called after all data has been inserted.
-    /// Index build is very fast (~0.0s for 1.7M rows).
     pub fn finalize_indexes(&self) -> anyhow::Result<()> {
-        create_indexes(&self.conn)
+        create_indexes(&self.conn)?;
+        self.conn.execute_batch("ANALYZE;")?;
+        Ok(())
     }
 
-    /// Drop all user-created indexes to prepare for bulk insert.
-    /// Use when switching an existing DB to bulk-import mode mid-session.
     pub fn drop_indexes(&self) -> anyhow::Result<()> {
         drop_indexes(&self.conn)
     }
@@ -55,36 +147,26 @@ impl DbStore {
     // ---- Files ----
 
     pub fn upsert_file(&mut self, path: &str, content: &str, language: &str) -> anyhow::Result<i64> {
-        let hash = self.content_hash(content);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-
-        let id: Option<i64> = self.conn.query_row(
-            "SELECT id FROM files WHERE path = ?",
-            params![path],
-            |r| r.get(0),
-        )
-        .optional()?;
-
+        let hash = hash_content(content);
+        let lang = lang_from_str(language);
+        let now = now_secs();
+        let id: Option<i64> = self
+            .conn
+            .query_row("SELECT id FROM files WHERE path = ?", params![path], |r| r.get(0))
+            .optional()?;
         if let Some(id) = id {
-            self.conn.execute(
-                "UPDATE files SET hash = ?, last_indexed = ? WHERE id = ?",
-                params![hash, now, id],
-            )?;
+            self.conn
+                .execute("UPDATE files SET hash=?, mtime=? WHERE id=?", params![hash, now, id])?;
             Ok(id)
         } else {
             self.conn.execute(
-                "INSERT INTO files (path, hash, language, last_indexed) VALUES (?, ?, ?, ?)",
-                params![path, hash, language, now],
+                "INSERT INTO files (path, hash, lang, mtime) VALUES (?,?,?,?)",
+                params![path, hash, lang, now],
             )?;
             Ok(self.conn.last_insert_rowid())
         }
     }
 
-    /// Upsert a batch of files within a single transaction.
-    /// Returns HashMap of path -> file_id.
     pub fn batch_upsert_files(
         &mut self,
         files: &[(&str, &str, &str)],
@@ -92,46 +174,33 @@ impl DbStore {
         if files.is_empty() {
             return Ok(HashMap::new());
         }
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-
-        // Pre-compute hashes outside the transaction to avoid borrow conflict
-        let hashes: Vec<String> = files.iter().map(|(_, c, _)| {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(c.as_bytes());
-            format!("{:x}", hasher.finalize())
-        }).collect();
-
+        let now = now_secs();
+        let hashes: Vec<String> = files.iter().map(|(_, c, _)| hash_content(c)).collect();
         let tx = self.conn.transaction()?;
-        let mut map = HashMap::new();
-
-        for ((path, _content, language), hash) in files.iter().zip(hashes.into_iter()) {
-            let id: Option<i64> = tx.query_row(
-                "SELECT id FROM files WHERE path = ?",
-                params![path],
-                |r| r.get(0),
-            )
-            .optional()?;
-
-            let file_id = if let Some(id) = id {
-                tx.execute(
-                    "UPDATE files SET hash = ?, last_indexed = ? WHERE id = ?",
-                    params![hash, now, id],
-                )?;
-                id
-            } else {
-                tx.execute(
-                    "INSERT INTO files (path, hash, language, last_indexed) VALUES (?, ?, ?, ?)",
-                    params![path, hash, language, now],
-                )?;
-                tx.last_insert_rowid()
-            };
-            map.insert(path.to_string(), file_id);
+        let mut map = HashMap::with_capacity(files.len());
+        {
+            let mut sel = tx.prepare_cached("SELECT id FROM files WHERE path=?")?;
+            let mut ins =
+                tx.prepare_cached("INSERT INTO files (path, hash, lang, mtime) VALUES (?,?,?,?)")?;
+            let mut upd = tx.prepare_cached("UPDATE files SET hash=?, mtime=? WHERE id=?")?;
+            for ((path, _content, language), hash) in files.iter().zip(hashes.into_iter()) {
+                let lang = lang_from_str(language);
+                let existing: Option<i64> = sel
+                    .query_row(params![path], |r| r.get(0))
+                    .optional()?;
+                let file_id = match existing {
+                    Some(id) => {
+                        upd.execute(params![hash, now, id])?;
+                        id
+                    }
+                    None => {
+                        ins.execute(params![path, hash, lang, now])?;
+                        tx.last_insert_rowid()
+                    }
+                };
+                map.insert(path.to_string(), file_id);
+            }
         }
-
         tx.commit()?;
         Ok(map)
     }
@@ -139,11 +208,7 @@ impl DbStore {
     pub fn get_file_id(&self, path: &str) -> anyhow::Result<Option<i64>> {
         let id: Option<i64> = self
             .conn
-            .query_row(
-                "SELECT id FROM files WHERE path = ?",
-                params![path],
-                |r| r.get(0),
-            )
+            .query_row("SELECT id FROM files WHERE path = ?", params![path], |r| r.get(0))
             .optional()?;
         Ok(id)
     }
@@ -151,85 +216,45 @@ impl DbStore {
     pub fn file_hash(&self, path: &str) -> anyhow::Result<Option<String>> {
         let hash: Option<String> = self
             .conn
-            .query_row(
-                "SELECT hash FROM files WHERE path = ?",
-                params![path],
-                |r| r.get(0),
-            )
+            .query_row("SELECT hash FROM files WHERE path = ?", params![path], |r| r.get(0))
             .optional()?;
         Ok(hash)
+    }
+
+    pub fn load_file_map(&self) -> anyhow::Result<HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare("SELECT id, path FROM files")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?)))?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (path, id) = row?;
+            map.insert(path, id);
+        }
+        Ok(map)
+    }
+
+    pub fn load_symbol_map(&self) -> anyhow::Result<HashMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT s.id, sn.text FROM symbols s JOIN strings sn ON s.name_id = sn.id")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (id, name) = row?;
+            map.entry(name).or_insert(id);
+        }
+        Ok(map)
     }
 
     // ---- Symbols ----
 
     pub fn insert_symbol(&mut self, sym: &Symbol) -> anyhow::Result<i64> {
-        let file_id = self.upsert_file(&sym.file_path, "", &self.language_from_path(&sym.file_path))?;
-        let tx = self.conn.transaction()?;
-
-        tx.execute(
-            "INSERT INTO symbols (
-                name, qualified_name, kind, is_definition, file_id,
-                line_start, line_end, column_start, column_end,
-                selection_line, selection_column,
-                scope_kind, scope_depth, parent_symbol_id, container_name,
-                declared_type, resolved_type, return_type, signature,
-                access_modifier, storage_class, linkage,
-                is_virtual, is_override, is_final, is_const_method,
-                base_classes, template_params,
-                declaration_text, definition_text, documentation,
-                lsp_kind
-            ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )",
-            params![
-                sym.name,
-                sym.qualified_name,
-                sym.kind.as_str(),
-                sym.is_definition as i32,
-                file_id,
-                sym.line_start as i32,
-                sym.line_end as i32,
-                sym.column_start as i32,
-                sym.column_end as i32,
-                sym.selection_line.map(|v| v as i32),
-                sym.selection_column.map(|v| v as i32),
-                sym.scope_kind.as_str(),
-                sym.scope_depth as i32,
-                sym.parent_symbol_id,
-                sym.container_name,
-                sym.declared_type,
-                sym.resolved_type,
-                sym.return_type,
-                sym.signature,
-                sym.access_modifier,
-                sym.storage_class,
-                sym.linkage,
-                sym.is_virtual as i32,
-                sym.is_override as i32,
-                sym.is_final as i32,
-                sym.is_const_method as i32,
-                sym.base_classes.as_ref().map(|v| v.to_string()),
-                sym.template_params.as_ref().map(|v| v.to_string()),
-                sym.declaration_text,
-                sym.definition_text,
-                sym.documentation,
-                sym.kind.lsp_kind() as i32,
-            ],
-        )?;
-        let id: i64 = tx.last_insert_rowid();
-        tx.commit()?;
-
-        // Update FTS
-        self.conn.execute(
-            "INSERT INTO symbols_fts(rowid, name, qualified_name) VALUES (?, ?, ?)",
-            params![id, sym.name, sym.qualified_name],
-        )?;
-
+        let file_id = self.upsert_file(&sym.file_path, "", &lang_str_for(&sym.file_path))?;
+        let map = HashMap::from([(sym.file_path.clone(), file_id)]);
+        self.batch_insert_symbols(std::slice::from_ref(sym), &map)?;
+        let id: i64 = self.conn.query_row("SELECT last_insert_rowid()", [], |r| r.get(0))?;
         Ok(id)
     }
 
-    /// Batch insert symbols within a single transaction.
-    /// `file_map` provides file_path -> file_id to avoid DB lookups.
     pub fn batch_insert_symbols(
         &mut self,
         symbols: &[Symbol],
@@ -238,72 +263,49 @@ impl DbStore {
         if symbols.is_empty() {
             return Ok(0);
         }
-
-        let tx = self.conn.transaction()?;
+        let Self { conn, str_cache } = self;
+        let tx = conn.transaction()?;
         let mut count = 0;
-
-        for sym in symbols {
-            let file_id = *file_map.get(&sym.file_path).unwrap_or(&0);
-            tx.execute(
-                "INSERT INTO symbols (
-                    name, qualified_name, kind, is_definition, file_id,
-                    line_start, line_end, column_start, column_end,
-                    selection_line, selection_column,
-                    scope_kind, scope_depth, parent_symbol_id, container_name,
-                    declared_type, resolved_type, return_type, signature,
-                    access_modifier, storage_class, linkage,
-                    is_virtual, is_override, is_final, is_const_method,
-                    base_classes, template_params,
-                    declaration_text, definition_text, documentation,
-                    lsp_kind
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )",
-                params![
-                    sym.name,
-                    sym.qualified_name,
-                    sym.kind.as_str(),
-                    sym.is_definition as i32,
+        {
+            let mut ins = tx.prepare_cached(INS_SYMBOL)?;
+            let mut fts = tx.prepare_cached(INS_FTS)?;
+            for sym in symbols {
+                let file_id = *file_map.get(&sym.file_path).unwrap_or(&0);
+                let name_id = intern(&tx, str_cache, &sym.name)?;
+                let qual_id = if sym.qualified_name == sym.name {
+                    name_id
+                } else {
+                    intern(&tx, str_cache, &sym.qualified_name)?
+                };
+                let container_id = match &sym.container_name {
+                    Some(c) if !c.is_empty() => Some(intern(&tx, str_cache, c)?),
+                    _ => None,
+                };
+                let kind = schema::kind_to_int(sym.kind.as_str());
+                let flags = symbol_flags(sym);
+                let scope_kind = schema::scope_to_int(sym.scope_kind.as_str());
+                ins.execute(params![
+                    name_id,
+                    qual_id,
+                    kind,
+                    flags,
                     file_id,
-                    sym.line_start as i32,
-                    sym.line_end as i32,
-                    sym.column_start as i32,
-                    sym.column_end as i32,
-                    sym.selection_line.map(|v| v as i32),
-                    sym.selection_column.map(|v| v as i32),
-                    sym.scope_kind.as_str(),
-                    sym.scope_depth as i32,
+                    sym.line_start as i64,
+                    sym.line_end as i64,
+                    sym.column_start as i64,
+                    sym.column_end as i64,
+                    sym.selection_line.map(|v| v as i64),
+                    sym.selection_column.map(|v| v as i64),
+                    scope_kind,
+                    sym.scope_depth as i64,
                     sym.parent_symbol_id,
-                    sym.container_name,
-                    sym.declared_type,
-                    sym.resolved_type,
-                    sym.return_type,
-                    sym.signature,
-                    sym.access_modifier,
-                    sym.storage_class,
-                    sym.linkage,
-                    sym.is_virtual as i32,
-                    sym.is_override as i32,
-                    sym.is_final as i32,
-                    sym.is_const_method as i32,
-                    sym.base_classes.as_ref().map(|v| v.to_string()),
-                    sym.template_params.as_ref().map(|v| v.to_string()),
-                    sym.declaration_text,
-                    sym.definition_text,
-                    sym.documentation,
-                    sym.kind.lsp_kind() as i32,
-                ],
-            )?;
-            let id: i64 = tx.last_insert_rowid();
-
-            // Update FTS
-            tx.execute(
-                "INSERT INTO symbols_fts(rowid, name, qualified_name) VALUES (?, ?, ?)",
-                params![id, sym.name, sym.qualified_name],
-            )?;
-            count += 1;
+                    container_id,
+                ])?;
+                let id = tx.last_insert_rowid();
+                fts.execute(params![id, sym.name])?;
+                count += 1;
+            }
         }
-
         tx.commit()?;
         Ok(count)
     }
@@ -311,59 +313,106 @@ impl DbStore {
     // ---- References ----
 
     pub fn insert_reference(&mut self, ref_: &Reference) -> anyhow::Result<i64> {
-        let file_id = self.get_file_id(&ref_.file_path)?.unwrap_or_else(|| {
-            // Fallback: create file entry if missing
-            self.upsert_file(&ref_.file_path, "", &self.language_from_path(&ref_.file_path))
-                .unwrap_or(0)
-        });
-
-        self.conn.execute(
-            r#"INSERT INTO "references" (
-                symbol_id, symbol_name, file_id, line, column, end_line, end_column,
-                ref_kind, context, context_detail, context_line, is_definition
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-            params![
-                ref_.symbol_id,
-                ref_.symbol_name,
-                file_id,
-                ref_.line as i32,
-                ref_.column as i32,
-                ref_.end_line.map(|v| v as i32),
-                ref_.end_column.map(|v| v as i32),
-                ref_.ref_kind.as_str(),
-                ref_.context,
-                ref_.context_detail,
-                ref_.context_line,
-                ref_.is_definition as i32,
-            ],
-        )?;
-        let id: i64 = self.conn.last_insert_rowid();
+        let file_id = self.get_file_id(&ref_.file_path)?.unwrap_or(0);
+        let map = HashMap::from([(ref_.file_path.clone(), file_id)]);
+        self.batch_insert_references(std::slice::from_ref(ref_), &map)?;
+        let id: i64 = self.conn.query_row("SELECT last_insert_rowid()", [], |r| r.get(0))?;
         Ok(id)
+    }
+
+    pub fn batch_insert_references(
+        &mut self,
+        references: &[Reference],
+        file_map: &HashMap<String, i64>,
+    ) -> anyhow::Result<usize> {
+        if references.is_empty() {
+            return Ok(0);
+        }
+        let Self { conn, str_cache } = self;
+        let tx = conn.transaction()?;
+        let mut count = 0;
+        {
+            let mut ins = tx.prepare_cached(INS_REF)?;
+            for r in references {
+                let file_id = *file_map.get(&r.file_path).unwrap_or(&0);
+                let name_id = intern(&tx, str_cache, &r.symbol_name)?;
+                let kind = schema::refkind_to_int(r.ref_kind.as_str());
+                let flags = if r.is_definition { schema::F_REF_IS_DEF } else { 0 };
+                ins.execute(params![
+                    name_id,
+                    file_id,
+                    r.line as i64,
+                    r.column as i64,
+                    r.end_line.map(|v| v as i64),
+                    r.end_column.map(|v| v as i64),
+                    kind,
+                    flags,
+                ])?;
+                count += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    // ---- Call edges (name-based) ----
+
+    pub fn batch_insert_call_edges(
+        &mut self,
+        edges: &[(String, String, String, u32, u32)],
+        file_map: &HashMap<String, i64>,
+    ) -> anyhow::Result<usize> {
+        if edges.is_empty() {
+            return Ok(0);
+        }
+        let Self { conn, str_cache } = self;
+        let tx = conn.transaction()?;
+        let mut count = 0;
+        {
+            let mut ins = tx.prepare_cached(INS_CALL)?;
+            for (caller, callee, file_path, line, col) in edges {
+                let file_id = *file_map.get(file_path).unwrap_or(&0);
+                let caller_id = intern(&tx, str_cache, caller)?;
+                let callee_id = intern(&tx, str_cache, callee)?;
+                ins.execute(params![caller_id, callee_id, file_id, *line as i64, *col as i64])?;
+                count += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    pub fn insert_call_edge(
+        &mut self,
+        caller_name: &str,
+        callee_name: &str,
+        file_path: &str,
+        line: u32,
+        column: u32,
+    ) -> anyhow::Result<()> {
+        let file_id = self.get_file_id(file_path)?.unwrap_or(0);
+        let edges = vec![(
+            caller_name.to_string(),
+            callee_name.to_string(),
+            file_path.to_string(),
+            line,
+            column,
+        )];
+        let map = HashMap::from([(file_path.to_string(), file_id)]);
+        self.batch_insert_call_edges(&edges, &map)?;
+        Ok(())
     }
 
     // ---- Macros ----
 
-    pub fn insert_macro(&mut self, macro_: &Macro) -> anyhow::Result<i64> {
-        let file_id = self.upsert_file(&macro_.file_path, "", &self.language_from_path(&macro_.file_path))?;
-        self.conn.execute(
-            "INSERT INTO macros (name, is_function_like, params, body, file_id, line, conditional_context)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![
-                macro_.name,
-                macro_.is_function_like as i32,
-                serde_json::to_string(&macro_.params).ok(),
-                &macro_.body,
-                file_id,
-                macro_.line as i32,
-                macro_.conditional_context.as_ref().map(|v| v.to_string()),
-            ],
-        )?;
-        let id: i64 = self.conn.last_insert_rowid();
+    pub fn insert_macro(&mut self, m: &Macro) -> anyhow::Result<i64> {
+        let file_id = self.upsert_file(&m.file_path, "", &lang_str_for(&m.file_path))?;
+        let map = HashMap::from([(m.file_path.clone(), file_id)]);
+        self.batch_insert_macros(std::slice::from_ref(m), &map)?;
+        let id: i64 = self.conn.query_row("SELECT last_insert_rowid()", [], |r| r.get(0))?;
         Ok(id)
     }
 
-    /// Batch insert macros within a single transaction.
-    /// `file_map` provides file_path -> file_id.
     pub fn batch_insert_macros(
         &mut self,
         macros: &[Macro],
@@ -372,150 +421,138 @@ impl DbStore {
         if macros.is_empty() {
             return Ok(0);
         }
-
-        let tx = self.conn.transaction()?;
+        let Self { conn, str_cache } = self;
+        let tx = conn.transaction()?;
         let mut count = 0;
-
-        for macro_ in macros {
-            let file_id = *file_map.get(&macro_.file_path).unwrap_or(&0);
-            tx.execute(
-                "INSERT INTO macros (name, is_function_like, params, body, file_id, line, conditional_context)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    macro_.name,
-                    macro_.is_function_like as i32,
-                    serde_json::to_string(&macro_.params).ok(),
-                    &macro_.body,
-                    file_id,
-                    macro_.line as i32,
-                    macro_.conditional_context.as_ref().map(|v| v.to_string()),
-                ],
-            )?;
-            count += 1;
+        {
+            let mut ins = tx.prepare_cached(INS_MACRO)?;
+            for m in macros {
+                let file_id = *file_map.get(&m.file_path).unwrap_or(&0);
+                let name_id = intern(&tx, str_cache, &m.name)?;
+                let params_id = if m.params.is_empty() {
+                    None
+                } else {
+                    Some(intern(&tx, str_cache, &serde_json::to_string(&m.params).unwrap_or_default())?)
+                };
+                let body_id = if m.body.is_empty() {
+                    None
+                } else {
+                    Some(intern(&tx, str_cache, &m.body)?)
+                };
+                let flags = if m.is_function_like { schema::F_MACRO_FN_LIKE } else { 0 };
+                ins.execute(params![name_id, flags, params_id, body_id, file_id, m.line as i64])?;
+                count += 1;
+            }
         }
-
         tx.commit()?;
         Ok(count)
     }
 
     // ---- Includes ----
 
+    pub fn batch_insert_includes(
+        &mut self,
+        includes: &[Include],
+        file_map: &HashMap<String, i64>,
+    ) -> anyhow::Result<usize> {
+        if includes.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut count = 0;
+        {
+            let mut ins = tx.prepare_cached(INS_INCLUDE)?;
+            for inc in includes {
+                let from_id = match file_map.get(&inc.from_file) {
+                    Some(&id) => id,
+                    None => continue,
+                };
+                let to_id = match file_map.get(&inc.to_file) {
+                    Some(&id) => id,
+                    None => continue,
+                };
+                let flags = if inc.is_system { schema::F_INCLUDE_SYSTEM } else { 0 };
+                ins.execute(params![from_id, to_id, inc.line as i64, flags])?;
+                count += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
     pub fn insert_include(&mut self, inc: &Include) -> anyhow::Result<()> {
-        let from_id = self.upsert_file(&inc.from_file, "", &self.language_from_path(&inc.from_file))?;
-        let to_id = self.upsert_file(&inc.to_file, "", &self.language_from_path(&inc.to_file))?;
-        self.conn.execute(
-            "INSERT INTO includes (from_file_id, to_file_id, line, is_system, original_text)
-             VALUES (?, ?, ?, ?, ?)",
-            params![
-                from_id,
-                to_id,
-                inc.line as i32,
-                inc.is_system as i32,
-                &inc.original_text,
-            ],
-        )?;
+        let map = self.load_file_map()?;
+        self.batch_insert_includes(std::slice::from_ref(inc), &map)?;
         Ok(())
     }
 
-    // ---- Struct Members ----
+    // ---- Struct members / inheritance ----
 
     pub fn insert_struct_member(
         &mut self,
         struct_symbol_id: i64,
         member_symbol_id: i64,
         member_index: u32,
-        access_modifier: Option<&str>,
+        _access_modifier: Option<&str>,
     ) -> anyhow::Result<()> {
         self.conn.execute(
-            "INSERT INTO struct_members (struct_symbol_id, member_symbol_id, member_index, access_modifier)
-             VALUES (?, ?, ?, ?)",
-            params![struct_symbol_id, member_symbol_id, member_index as i32, access_modifier],
+            "INSERT OR IGNORE INTO struct_members (struct_id, member_id, idx) VALUES (?,?,?)",
+            params![struct_symbol_id, member_symbol_id, member_index as i64],
         )?;
         Ok(())
     }
-
-    // ---- Call Edges ----
-
-    pub fn insert_call_edge(
-        &mut self,
-        caller_id: i64,
-        callee_id: i64,
-        file_path: &str,
-        line: u32,
-        column: u32,
-        call_type: &str,
-        args_text: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let file_id = self.upsert_file(file_path, "", &self.language_from_path(file_path))?;
-        self.conn.execute(
-            "INSERT INTO call_edges (caller_symbol_id, callee_symbol_id, file_id, line, column, call_type, args_text)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![
-                caller_id,
-                callee_id,
-                file_id,
-                line as i32,
-                column as i32,
-                call_type,
-                args_text,
-            ],
-        )?;
-        Ok(())
-    }
-
-    // ---- Type Aliases ----
-
-    pub fn insert_type_alias(
-        &mut self,
-        alias_name: &str,
-        underlying_type: &str,
-        resolved_symbol_id: Option<i64>,
-        file_path: &str,
-        line: u32,
-    ) -> anyhow::Result<()> {
-        let file_id = self.upsert_file(file_path, "", &self.language_from_path(file_path))?;
-        self.conn.execute(
-            "INSERT INTO type_aliases (alias_name, underlying_type, resolved_symbol_id, file_id, line)
-             VALUES (?, ?, ?, ?, ?)",
-            params![alias_name, underlying_type, resolved_symbol_id, file_id, line as i32],
-        )?;
-        Ok(())
-    }
-
-    // ---- Inheritance ----
 
     pub fn insert_inheritance(
         &mut self,
         derived_id: i64,
         base_id: i64,
-        access_modifier: Option<&str>,
+        _access_modifier: Option<&str>,
         is_virtual: bool,
     ) -> anyhow::Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO inheritance (derived_symbol_id, base_symbol_id, access_modifier, is_virtual)
-             VALUES (?, ?, ?, ?)",
-            params![derived_id, base_id, access_modifier, is_virtual as i32],
+            "INSERT OR REPLACE INTO inheritance (derived_id, base_id, flags) VALUES (?,?,?)",
+            params![derived_id, base_id, if is_virtual { 1 } else { 0 }],
         )?;
         Ok(())
     }
 
-    // ---- Helpers ----
+    // ---- Deletion (incremental) ----
 
-    fn content_hash(&self, content: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        format!("{:x}", hasher.finalize())
+    pub fn delete_file_data(&mut self, file_id: i64) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM symbols_fts WHERE rowid IN (SELECT id FROM symbols WHERE file_id=?)",
+            params![file_id],
+        )?;
+        tx.execute("DELETE FROM refs WHERE file_id=?", params![file_id])?;
+        tx.execute("DELETE FROM call_edges WHERE file_id=?", params![file_id])?;
+        tx.execute("DELETE FROM macros WHERE file_id=?", params![file_id])?;
+        tx.execute(
+            "DELETE FROM includes WHERE from_file_id=? OR to_file_id=?",
+            params![file_id, file_id],
+        )?;
+        tx.execute(
+            "DELETE FROM struct_members WHERE struct_id IN (SELECT id FROM symbols WHERE file_id=?)
+             OR member_id IN (SELECT id FROM symbols WHERE file_id=?)",
+            params![file_id, file_id],
+        )?;
+        tx.execute(
+            "DELETE FROM inheritance WHERE derived_id IN (SELECT id FROM symbols WHERE file_id=?)
+             OR base_id IN (SELECT id FROM symbols WHERE file_id=?)",
+            params![file_id, file_id],
+        )?;
+        tx.execute("DELETE FROM symbols WHERE file_id=?", params![file_id])?;
+        tx.commit()?;
+        Ok(())
     }
 
-    fn language_from_path(&self, path: &str) -> String {
-        match path.rsplit('.').next() {
-            Some("c") | Some("h") => "c".to_string(),
-            Some("cpp") | Some("cxx") | Some("cc") | Some("hpp") | Some("hxx") | Some("hh") => {
-                "cpp".to_string()
-            }
-            _ => "c".to_string(),
-        }
+    pub fn delete_file(&mut self, file_id: i64) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM files WHERE id = ?", params![file_id])?;
+        Ok(())
     }
+
+    // ---- Misc ----
 
     pub fn conn(&self) -> &rusqlite::Connection {
         &self.conn
@@ -526,162 +563,30 @@ impl DbStore {
     }
 
     pub fn commit_transaction(&mut self) -> anyhow::Result<()> {
-        // No-op: transactions are auto-committed when dropped.
-        // This exists for API symmetry with the engine.
         Ok(())
     }
 
-    /// Lookup symbol ID by name and kind. Returns the first match.
-    pub fn get_symbol_id(&self, name: &str, kind: &str) -> anyhow::Result<Option<i64>> {
-        let id: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM symbols WHERE name = ? AND kind = ? LIMIT 1",
-                params![name, kind],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(id)
-    }
-
-    /// Lookup symbol ID by name (any kind). Returns the first match.
-    pub fn get_symbol_id_any(&self, name: &str) -> anyhow::Result<Option<i64>> {
-        let id: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM symbols WHERE name = ? LIMIT 1",
-                params![name],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(id)
-    }
-
-    /// Load all symbol names into a HashMap for fast lookup.
-    /// Returns (name -> id) mapping, taking the first match per name.
-    pub fn load_symbol_map(&self) -> anyhow::Result<HashMap<String, i64>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name FROM symbols"
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut map = HashMap::new();
-        for row in rows {
-            let (id, name) = row?;
-            map.entry(name).or_insert(id);
-        }
-        Ok(map)
-    }
-
-    /// Batch insert references within a transaction.
-    /// Also accepts a file_id cache to avoid repeated DB lookups.
-    pub fn batch_insert_references(
-        &mut self,
-        references: &[Reference],
-        file_map: &HashMap<String, i64>,
-    ) -> anyhow::Result<usize> {
-        if references.is_empty() {
-            return Ok(0);
-        }
-
-        let tx = self.conn.transaction()?;
-        let mut count = 0;
-        for ref_ in references {
-            let file_id = *file_map.get(&ref_.file_path).unwrap_or(&0);
-            tx.execute(
-                r#"INSERT INTO "references" (
-                    symbol_id, symbol_name, file_id, line, column, end_line, end_column,
-                    ref_kind, context, context_detail, context_line, is_definition
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-                params![
-                    ref_.symbol_id,
-                    ref_.symbol_name,
-                    file_id,
-                    ref_.line as i32,
-                    ref_.column as i32,
-                    ref_.end_line.map(|v| v as i32),
-                    ref_.end_column.map(|v| v as i32),
-                    ref_.ref_kind.as_str(),
-                    ref_.context.as_deref(),
-                    ref_.context_detail.as_deref(),
-                    ref_.context_line.as_deref(),
-                    ref_.is_definition as i32,
-                ],
-            )?;
-            count += 1;
-        }
-        tx.commit()?;
-        Ok(count)
-    }
-
-    /// Batch insert call edges within a transaction.
-    pub fn batch_insert_call_edges(
-        &mut self,
-        edges: &[(i64, i64, String, u32, u32, String)],
-        file_map: &HashMap<String, i64>,
-    ) -> anyhow::Result<usize> {
-        if edges.is_empty() {
-            return Ok(0);
-        }
-
-        let tx = self.conn.transaction()?;
-        let mut count = 0;
-        for (caller_id, callee_id, file_path, line, column, args_text) in edges {
-            let file_id = *file_map.get(file_path).unwrap_or(&0);
-            tx.execute(
-                "INSERT INTO call_edges (caller_symbol_id, callee_symbol_id, file_id, line, column, call_type, args_text)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    caller_id, callee_id, file_id,
-                    *line as i32, *column as i32,
-                    "direct", args_text.as_str(),
-                ],
-            )?;
-            count += 1;
-        }
-        tx.commit()?;
-        Ok(count)
-    }
-
-    /// Load all file paths into a HashMap for fast lookup.
-    pub fn load_file_map(&self) -> anyhow::Result<HashMap<String, i64>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, path FROM files"
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
-        })?;
-        let mut map = HashMap::new();
-        for row in rows {
-            let (path, id) = row?;
-            map.insert(path, id);
-        }
-        Ok(map)
-    }
-
-    // ---- Stats ----
-
     pub fn stats(&self) -> anyhow::Result<serde_json::Value> {
-        let file_count: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
-        let symbol_count: i64 =
-            self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
-        let ref_count: i64 =
-            self.conn.query_row(r#"SELECT COUNT(*) FROM "references""#, [], |r| r.get(0))?;
-        let macro_count: i64 =
-            self.conn.query_row("SELECT COUNT(*) FROM macros", [], |r| r.get(0))?;
-        let include_count: i64 =
-            self.conn.query_row("SELECT COUNT(*) FROM includes", [], |r| r.get(0))?;
-        let call_edge_count: i64 =
-            self.conn.query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))?;
-
+        let c = |sql: &str| -> i64 {
+            self.conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0)
+        };
         Ok(serde_json::json!({
-            "files": file_count,
-            "symbols": symbol_count,
-            "references": ref_count,
-            "macros": macro_count,
-            "includes": include_count,
-            "call_edges": call_edge_count,
+            "files": c("SELECT COUNT(*) FROM files"),
+            "symbols": c("SELECT COUNT(*) FROM symbols"),
+            "references": c("SELECT COUNT(*) FROM refs"),
+            "macros": c("SELECT COUNT(*) FROM macros"),
+            "includes": c("SELECT COUNT(*) FROM includes"),
+            "call_edges": c("SELECT COUNT(*) FROM call_edges"),
+            "strings": c("SELECT COUNT(*) FROM strings"),
+            "db_bytes": c("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()"),
         }))
+    }
+}
+
+fn lang_str_for(path: &str) -> String {
+    if lang_from_path(path) == schema::LANG_CPP {
+        "cpp".to_string()
+    } else {
+        "c".to_string()
     }
 }

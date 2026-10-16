@@ -84,6 +84,30 @@ impl SourceTree {
         })
     }
 
+    /// Parse source code using an existing parser (for thread-local parser reuse).
+    pub fn parse_with_parser(parser: &mut Parser, language: LanguageKind, source: &[u8]) -> Result<Self> {
+        parser
+            .set_language(&language.language())
+            .context("Failed to set parser language")?;
+
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| anyhow!("Failed to parse source code"))?;
+
+        // We need to keep a parser in the SourceTree for reparsing,
+        // so create a minimal one (the caller's parser is reused for the next file).
+        let mut inner_parser = Parser::new();
+        inner_parser.set_language(&language.language()).ok();
+
+        Ok(Self {
+            parser: inner_parser,
+            tree,
+            source: source.to_vec(),
+            file_path: String::new(),
+            language,
+        })
+    }
+
     /// Parse source code, detecting language from file extension.
     pub fn parse_from_path(path: &Path, source: &[u8]) -> Result<Self> {
         let language = LanguageKind::from_path(path)

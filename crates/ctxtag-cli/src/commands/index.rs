@@ -45,7 +45,7 @@ pub fn cmd_update(args: UpdateArgs, db_path: &str) -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let engine = IndexEngine::new(config)?;
+    let mut engine = IndexEngine::new(config)?;
     let stats = engine.update()?;
     println!("Update complete:");
     println!("{}", serde_json::to_string_pretty(&stats)?);

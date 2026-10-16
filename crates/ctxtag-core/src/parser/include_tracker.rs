@@ -44,7 +44,9 @@ impl IncludeTracker {
         // - string_literal (for #include "file.h")
         // - system_lib_string (for #include <stdio.h>)
 
-        let path_node = node.child(0);
+        let path_node = node
+            .child_by_field_name("path")
+            .or_else(|| node.named_child(0));
         let content = match path_node {
             Some(n) => {
                 let text = tree.node_text(&n);

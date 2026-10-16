@@ -3,17 +3,36 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
+use rayon::prelude::*;
+use tree_sitter::Parser;
 use walkdir::WalkDir;
 
 use crate::db::DbStore;
 use crate::model::{Include, Macro, Reference, Symbol};
 use crate::parser::{
-    CallGraph, IncludeTracker, LanguageKind, MacroTracker, ScopeBuilder,
-    SourceTree, SymbolExtractor,
+    CallGraph, IncludeTracker, LanguageKind, MacroTracker, SourceTree, SymbolExtractor,
 };
 
 use super::include_resolver::IncludeResolver;
 use super::incremental::IncrementalIndexer;
+
+/// Files are parsed in parallel in chunks, then written sequentially. Chunking
+/// bounds memory regardless of project size while keeping a single parse per
+/// file (symbols, references, macros, includes and call edges are all extracted
+/// from one tree walk).
+const CHUNK: usize = 128;
+
+/// Everything extracted from one file in a single parse.
+struct FileData {
+    path: String,
+    content: String,
+    lang: LanguageKind,
+    symbols: Vec<Symbol>,
+    macros: Vec<Macro>,
+    includes: Vec<Include>,
+    refs: Vec<Reference>,
+    calls: Vec<(String, String, u32, u32)>, // caller, callee, line, col
+}
 
 /// Configuration for indexing.
 #[derive(Debug, Clone)]
@@ -22,9 +41,7 @@ pub struct IndexConfig {
     pub db_path: String,
     pub extensions: Vec<String>,
     pub exclude_patterns: Vec<String>,
-    /// If true, uses deferred index creation (indexes built after all inserts)
-    /// and aggressive SQLite pragmas for ~1.7x faster bulk indexing.
-    /// Default: false (incremental/LSP mode with indexes maintained live).
+    /// Bulk mode defers index creation and uses aggressive SQLite pragmas.
     pub bulk_mode: bool,
 }
 
@@ -46,7 +63,6 @@ impl Default for IndexConfig {
     }
 }
 
-/// Main indexing engine.
 pub struct IndexEngine {
     config: IndexConfig,
     store: DbStore,
@@ -61,268 +77,153 @@ impl IndexEngine {
             DbStore::new(&config.db_path)?
         };
         let include_resolver = IncludeResolver::new(&config.root_dir);
-        Ok(Self {
-            config,
-            store,
-            include_resolver,
-        })
+        Ok(Self { config, store, include_resolver })
     }
 
-    /// Index an entire project directory using a two-pass streaming approach.
-    ///
-    /// Pass 1: Parse each file, extract and write symbols/macros/includes to DB immediately.
-    /// Pass 2: Parse each file again, resolve references against in-memory symbol map,
-    ///         batch-write to DB.
-    ///
-    /// Only one file's data is held in memory at a time.
-    /// Symbol ID map and file ID map are cached in memory to avoid per-query DB lookups.
     pub fn index(&mut self) -> anyhow::Result<IndexStats> {
         let files = self.discover_files();
         let total = files.len();
         let mut stats = IndexStats::default();
-
         let start = Instant::now();
 
-        // Pass 1: Extract symbols, macros, includes - batch write to DB
-        // Accumulates data across files and flushes in batches to reduce
-        // transaction overhead (from ~100k transactions to ~1k).
-        tracing::info!("Pass 1: symbol extraction ({} files)", total);
-        let pass1_start = Instant::now();
+        if self.config.bulk_mode {
+            // Fresh DB in bulk mode: start clean and defer indexes.
+            let _ = self.store.drop_indexes();
+        }
 
-        const P1_BATCH: usize = 50;
-        let mut file_batch: Vec<(String, String, &'static str)> = Vec::with_capacity(P1_BATCH);
-        let mut sym_batch: Vec<Symbol> = Vec::with_capacity(2048);
-        let mut macro_batch: Vec<Macro> = Vec::with_capacity(256);
+        let mut global_map: HashMap<String, i64> = HashMap::new();
         let mut all_includes: Vec<Include> = Vec::new();
-        let mut file_map: HashMap<String, i64> = HashMap::new();
+        let threads = rayon::current_num_threads();
+        tracing::info!("Indexing {} files ({} threads, single pass)", total, threads);
 
-        for (i, file_path) in files.iter().enumerate() {
-            if i > 0 && i % (total.saturating_sub(1) / 100).max(1) == 0 {
-                tracing::info!("Pass 1: {}/{} files ({}%)", i, total, i * 100 / total);
+        for (ci, chunk) in files.chunks(CHUNK).enumerate() {
+            let data: Vec<FileData> = chunk
+                .par_iter()
+                .filter_map(|p| Self::parse_file(p))
+                .collect();
+
+            // Register files (hash computed from in-memory content, no clone).
+            let fb_refs: Vec<(&str, &str, &str)> = data
+                .iter()
+                .map(|d| {
+                    (
+                        d.path.as_str(),
+                        d.content.as_str(),
+                        if d.lang == LanguageKind::Cpp { "cpp" } else { "c" },
+                    )
+                })
+                .collect();
+            let fmap = self.store.batch_upsert_files(&fb_refs)?;
+            global_map.extend(fmap.clone());
+
+            // Move extracted rows out of FileData into per-chunk batches.
+            let mut syms: Vec<Symbol> = Vec::new();
+            let mut macs: Vec<Macro> = Vec::new();
+            let mut refs: Vec<Reference> = Vec::new();
+            let mut calls: Vec<(String, String, String, u32, u32)> = Vec::new();
+            for d in data {
+                stats.files_indexed += 1;
+                for (caller, callee, line, col) in d.calls {
+                    calls.push((caller, callee, d.path.clone(), line, col));
+                }
+                all_includes.extend(d.includes);
+                syms.extend(d.symbols);
+                macs.extend(d.macros);
+                refs.extend(d.refs);
             }
 
-            match self.index_file_pass1(file_path) {
-                Ok((content, language, symbols, macros, includes)) => {
-                    let lang_str: &'static str = if language == LanguageKind::Cpp { "cpp" } else { "c" };
-                    file_batch.push((file_path.clone(), content, lang_str));
-                    sym_batch.extend(symbols);
-                    macro_batch.extend(macros);
-                    all_includes.extend(includes);
-                    stats.files_indexed += 1;
+            stats.symbols_extracted += self.store.batch_insert_symbols(&syms, &fmap)?;
+            stats.macros_indexed += self.store.batch_insert_macros(&macs, &fmap)?;
+            stats.references_resolved += self.store.batch_insert_references(&refs, &fmap)?;
+            stats.call_edges += self.store.batch_insert_call_edges(&calls, &fmap)?;
 
-                    // Flush batch when large enough or at the end
-                    if file_batch.len() >= P1_BATCH || i == total - 1 {
-                        let fb_refs: Vec<_> = file_batch.iter().map(|(p, c, l)| (p.as_str(), c.as_str(), *l)).collect();
-                        let fmap = self.store.batch_upsert_files(&fb_refs)?;
-                        file_map.extend(fmap);
-                        file_batch.clear();
-
-                        if !sym_batch.is_empty() {
-                            let count = sym_batch.len();
-                            self.store.batch_insert_symbols(&sym_batch, &file_map)?;
-                            stats.symbols_extracted += count;
-                            sym_batch.clear();
-                        }
-
-                        if !macro_batch.is_empty() {
-                            let count = macro_batch.len();
-                            self.store.batch_insert_macros(&macro_batch, &file_map)?;
-                            stats.macros_indexed += count;
-                            macro_batch.clear();
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to index {}: {}", file_path, e);
-                    stats.files_failed += 1;
-                }
-            }
-        }
-
-        tracing::info!(
-            "Pass 1 complete in {:.1}s: {} symbols, {} macros",
-            pass1_start.elapsed().as_secs_f32(),
-            stats.symbols_extracted,
-            stats.macros_indexed,
-        );
-
-        // Resolve include paths
-        let resolved_includes = self.include_resolver.resolve_all(&all_includes, &files);
-        stats.includes_resolved = resolved_includes.len();
-        drop(all_includes);
-
-        // Load symbol map into memory for Pass 2
-        // (file_map is already cached from Pass 1 batch inserts)
-        tracing::info!("Loading symbol map from DB...");
-        let load_start = Instant::now();
-        let symbol_map = self.store.load_symbol_map()?;
-        tracing::info!(
-            "Loaded {} symbols in {:.1}s",
-            symbol_map.len(),
-            load_start.elapsed().as_secs_f32(),
-        );
-
-        // Pass 2: Resolve references and call edges using in-memory maps
-        // Accumulates references across a batch of files before writing to DB
-        // to reduce transaction overhead.
-        tracing::info!("Pass 2: reference resolution ({} files)", total);
-        let pass2_start = Instant::now();
-
-        const BATCH_SIZE: usize = 50;
-        let mut ref_batch: Vec<Reference> = Vec::with_capacity(4096);
-        let mut edge_batch: Vec<(i64, i64, String, u32, u32, String)> = Vec::with_capacity(1024);
-
-        for (i, file_path) in files.iter().enumerate() {
-            if i > 0 && i % (total.saturating_sub(1) / 100).max(1) == 0 {
-                tracing::info!("Pass 2: {}/{} files ({}%)", i, total, i * 100 / total);
-            }
-
-            match self.index_file_pass2(file_path, &symbol_map, &mut stats) {
-                Ok((refs, edges)) => {
-                    ref_batch.extend(refs);
-                    edge_batch.extend(edges);
-
-                    // Flush batch when large enough or at the end
-                    if ref_batch.len() >= BATCH_SIZE * 200 || edge_batch.len() >= BATCH_SIZE * 50
-                        || i == total - 1
-                    {
-                        if !ref_batch.is_empty() {
-                            let count = ref_batch.len();
-                            self.store.batch_insert_references(&ref_batch, &file_map)?;
-                            stats.references_resolved += count;
-                            ref_batch.clear();
-                        }
-                        if !edge_batch.is_empty() {
-                            let count = edge_batch.len();
-                            self.store.batch_insert_call_edges(&edge_batch, &file_map)?;
-                            stats.call_edges += count;
-                            edge_batch.clear();
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to resolve refs for {}: {}", file_path, e);
-                    stats.files_failed += 1;
-                }
+            if total > 2000 && ci % 20 == 0 {
+                tracing::info!(
+                    "  {}/{} files ({}%)",
+                    stats.files_indexed,
+                    total,
+                    stats.files_indexed * 100 / total.max(1)
+                );
             }
         }
 
-        // Flush any remaining items
-        if !ref_batch.is_empty() {
-            let count = ref_batch.len();
-            self.store.batch_insert_references(&ref_batch, &file_map)?;
-            stats.references_resolved += count;
-        }
-        if !edge_batch.is_empty() {
-            let count = edge_batch.len();
-            self.store.batch_insert_call_edges(&edge_batch, &file_map)?;
-            stats.call_edges += count;
-        }
+        // Resolve and persist include edges against the full file map.
+        let resolved = self.include_resolver.resolve_all(&all_includes, &files);
+        stats.includes_resolved = self.store.batch_insert_includes(&resolved, &global_map)?;
 
-        tracing::info!(
-            "Pass 2 complete in {:.1}s: {} references, {} call edges",
-            pass2_start.elapsed().as_secs_f32(),
-            stats.references_resolved,
-            stats.call_edges,
-        );
-
-        // Build indexes after all data has been inserted (bulk mode optimization).
-        // This avoids index maintenance overhead during the ~1.7M row inserts,
-        // giving a 1.7x speedup over live index maintenance.
         if self.config.bulk_mode {
             let idx_start = Instant::now();
             tracing::info!("Building indexes...");
             self.store.finalize_indexes()?;
-            tracing::info!(
-                "Indexes built in {:.1}s",
-                idx_start.elapsed().as_secs_f32()
-            );
+            tracing::info!("Indexes built in {:.1}s", idx_start.elapsed().as_secs_f32());
         }
 
-        let elapsed = start.elapsed();
-        tracing::info!("Indexing complete in {:.1}s: {:?}", elapsed.as_secs_f32(), stats);
+        tracing::info!(
+            "Indexing complete in {:.1}s: {:?}",
+            start.elapsed().as_secs_f32(),
+            stats
+        );
         Ok(stats)
     }
 
-    /// Pass 1: Parse a single file, extract symbols/macros/includes.
-    /// Returns (content, language, symbols, macros, includes) for batch insertion.
-    fn index_file_pass1(
-        &self,
-        file_path: &str,
-    ) -> anyhow::Result<(String, LanguageKind, Vec<Symbol>, Vec<Macro>, Vec<Include>)> {
-        let content = fs::read_to_string(file_path)?;
-        let content_bytes = content.as_bytes();
+    /// Parse one file exactly once, extracting all entity kinds.
+    fn parse_file(path: &str) -> Option<FileData> {
+        let mut parser = Parser::new();
+        Self::init_parser(&mut parser, path).ok()?;
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to read {}: {}", path, e);
+                return None;
+            }
+        };
+        let language = Self::detect_language(path);
+        let mut tree = match SourceTree::parse_with_parser(&mut parser, language, content.as_bytes())
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to parse {}: {}", path, e);
+                return None;
+            }
+        };
+        tree.set_file_path(path.to_string());
 
-        let language = Self::detect_language(file_path);
-        let mut tree = SourceTree::parse(language, content_bytes)?;
-        tree.set_file_path(file_path.to_string());
-
-        // Extract symbols
-        let mut extractor = SymbolExtractor::new(file_path);
+        let mut extractor = SymbolExtractor::new(path);
         let symbols = extractor.extract(&tree);
 
-        // Extract macros
         let mut macro_tracker = MacroTracker::new();
         let macros = macro_tracker.track(&tree);
 
-        // Extract includes
         let mut include_tracker = IncludeTracker::new();
         let includes = include_tracker.track(&tree);
 
-        drop(tree);
+        // References are resolved by name at query time; pass an empty symbol
+        // map so we emit name-based references without a second parse.
+        let empty: HashMap<String, i64> = HashMap::new();
+        let no_scopes: &[crate::model::Scope] = &[];
+        let refs = resolve_references_with_map(&tree, no_scopes, &empty);
 
-        Ok((content, language, symbols, macros, includes))
-    }
-
-    /// Pass 2: Parse a single file, resolve references and call edges.
-    /// Uses in-memory symbol_map to resolve real DB symbol IDs.
-    /// Returns (references, resolved_call_edges) for batch insertion.
-    fn index_file_pass2(
-        &self,
-        file_path: &str,
-        symbol_map: &HashMap<String, i64>,
-        _stats: &mut IndexStats,
-    ) -> anyhow::Result<(Vec<Reference>, Vec<(i64, i64, String, u32, u32, String)>)> {
-        let content = fs::read_to_string(file_path)?;
-        let content_bytes = content.as_bytes();
-
-        let language = Self::detect_language(file_path);
-        let mut tree = SourceTree::parse(language, content_bytes)?;
-        tree.set_file_path(file_path.to_string());
-
-        // Build scope chain from tree
-        let mut scope_builder = ScopeBuilder::new();
-        let global_scope = scope_builder.build(&tree);
-        let scopes = vec![global_scope];
-
-        // Resolve references using the in-memory symbol map for real DB IDs
-        let references = resolve_references_with_map(&tree, &scopes, symbol_map);
-
-        // Extract call graph
         let mut call_graph = CallGraph::new();
         let edges = call_graph.extract(&tree);
-
-        // Resolve call edges using in-memory symbol map
-        let mut resolved_edges: Vec<(i64, i64, String, u32, u32, String)> = Vec::new();
-        for edge in edges {
-            if let Some(caller_name) = &edge.caller_name {
-                if let (Some(&caller_id), Some(&callee_id)) = (
-                    symbol_map.get(caller_name),
-                    symbol_map.get(&edge.callee_name),
-                ) {
-                    resolved_edges.push((
-                        caller_id,
-                        callee_id,
-                        file_path.to_string(),
-                        edge.line,
-                        edge.column,
-                        edge.call_text,
-                    ));
+        let mut calls = Vec::new();
+        for e in edges {
+            if let Some(caller) = e.caller_name {
+                if !caller.is_empty() && !e.callee_name.is_empty() {
+                    calls.push((caller, e.callee_name, e.line, e.column));
                 }
             }
         }
 
-        Ok((references, resolved_edges))
+        Some(FileData {
+            path: path.to_string(),
+            content,
+            lang: language,
+            symbols,
+            macros,
+            includes,
+            refs,
+            calls,
+        })
     }
 
     fn detect_language(file_path: &str) -> LanguageKind {
@@ -339,62 +240,51 @@ impl IndexEngine {
         }
     }
 
-    /// Discover C/C++ source files in the project root.
+    fn init_parser(parser: &mut Parser, file_path: &str) -> anyhow::Result<()> {
+        let language = Self::detect_language(file_path);
+        parser.set_language(&language.language())?;
+        Ok(())
+    }
+
     pub fn discover_files(&self) -> Vec<String> {
         let mut files = Vec::new();
         let root = Path::new(&self.config.root_dir);
-
         for entry in WalkDir::new(root).follow_links(false).into_iter() {
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-
             let path = entry.path();
             if !path.is_file() {
                 continue;
             }
-
-            // Check extension
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
             if !self.config.extensions.contains(&ext.to_string()) {
                 continue;
             }
-
-            // Check exclude patterns
             let path_str = path.to_string_lossy().to_string();
-            let mut excluded = false;
-            for pattern in &self.config.exclude_patterns {
-                if path_str.contains(pattern) {
-                    excluded = true;
-                    break;
-                }
-            }
-            if excluded {
+            if self.config.exclude_patterns.iter().any(|p| path_str.contains(p)) {
                 continue;
             }
-
-            // Make path absolute
             if let Ok(abs) = fs::canonicalize(path) {
                 files.push(abs.to_string_lossy().to_string());
             }
         }
-
         files.sort();
         files
     }
 
-    /// Incremental update: only re-index changed files.
-    pub fn update(&self) -> anyhow::Result<IndexStats> {
-        let incremental = IncrementalIndexer::new(&self.config.root_dir, &self.store);
+    pub fn update(&mut self) -> anyhow::Result<IndexStats> {
+        let mut incremental = IncrementalIndexer::new(
+            &self.config.root_dir,
+            &mut self.store,
+            self.config.extensions.clone(),
+            self.config.exclude_patterns.clone(),
+        );
         incremental.update()
     }
 }
 
-/// Statistics from an indexing run.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct IndexStats {
     pub files_indexed: usize,
@@ -406,12 +296,9 @@ pub struct IndexStats {
     pub call_edges: usize,
 }
 
+// ─── Reference Resolution (name-based) ─────────────────────────────────
 
-// ─── Reference Resolution with DB Symbol Map ──────────────────────────
-
-/// Resolves references in a source tree using the DB symbol map.
-/// Returns references with real DB symbol IDs instead of placeholders.
-fn resolve_references_with_map(
+pub(super) fn resolve_references_with_map(
     tree: &SourceTree,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
@@ -465,17 +352,13 @@ fn resolve_ref_id(
         Some(p) => p,
         None => return,
     };
-
     if is_keyword(name) || is_type_ctx(parent.kind()) {
         return;
     }
-
     let (ref_kind, context) = classify_ref(parent.kind());
     let symbol_id = lookup_id(name, scopes, symbol_map);
-
     let pos = node.start_position();
     let end_pos = node.end_position();
-
     refs.push(Reference {
         id: None,
         symbol_id,
@@ -504,13 +387,10 @@ fn resolve_ref_call(
         Some(f) => f,
         None => return,
     };
-
     let name = tree.node_text(&function);
     let symbol_id = lookup_id(name, scopes, symbol_map);
-
     let pos = function.start_position();
     let end_pos = function.end_position();
-
     refs.push(Reference {
         id: None,
         symbol_id,
@@ -536,10 +416,8 @@ fn resolve_ref_qualified(
 ) {
     let full_name = tree.node_text(&node);
     let symbol_id = *symbol_map.get(full_name).unwrap_or(&0);
-
     let pos = node.start_position();
     let end_pos = node.end_position();
-
     refs.push(Reference {
         id: None,
         symbol_id,
@@ -568,14 +446,11 @@ fn resolve_ref_field(
         Some(f) => f,
         None => return,
     };
-
     let field_name = tree.node_text(&field);
     let symbol_id = lookup_id(field_name, scopes, symbol_map);
-
     let pos = field.start_position();
     let end_pos = field.end_position();
     let is_ptr = tree.node_text(&node).contains("->");
-
     refs.push(Reference {
         id: None,
         symbol_id,
@@ -595,8 +470,6 @@ fn resolve_ref_field(
         context_line: None,
         is_definition: false,
     });
-
-    // Also resolve operand if it's an identifier
     if let Some(operand) = node.child_by_field_name("operand") {
         if operand.kind() == "identifier" {
             resolve_ref_id(operand, tree, scopes, symbol_map, refs);
@@ -604,16 +477,14 @@ fn resolve_ref_field(
     }
 }
 
-fn lookup_id(
+pub(super) fn lookup_id(
     name: &str,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
 ) -> i64 {
-    // Fast path: DB symbol map
     if let Some(&id) = symbol_map.get(name) {
         return id;
     }
-    // Scope chain fallback
     if let Some(sym) = crate::model::Scope::lookup_chain(scopes, name) {
         if let Some(id) = sym.id {
             return id;
@@ -625,7 +496,9 @@ fn lookup_id(
     0
 }
 
-fn classify_ref(parent_kind: &str) -> (crate::model::ReferenceKind, Option<String>) {
+pub(super) fn classify_ref(
+    parent_kind: &str,
+) -> (crate::model::ReferenceKind, Option<String>) {
     match parent_kind {
         "field_declaration" => (crate::model::ReferenceKind::Declaration, Some("field".into())),
         "declaration" => (crate::model::ReferenceKind::Declaration, Some("declaration".into())),
@@ -637,36 +510,36 @@ fn classify_ref(parent_kind: &str) -> (crate::model::ReferenceKind, Option<Strin
     }
 }
 
-fn is_keyword(name: &str) -> bool {
+pub(super) fn is_keyword(name: &str) -> bool {
     matches!(
         name,
         "auto" | "break" | "case" | "char" | "const" | "continue"
-        | "default" | "do" | "double" | "else" | "enum" | "extern"
-        | "float" | "for" | "goto" | "if" | "inline" | "int" | "long"
-        | "register" | "restrict" | "return" | "short" | "signed"
-        | "sizeof" | "static" | "struct" | "switch" | "typedef"
-        | "union" | "unsigned" | "void" | "volatile" | "while"
-        | "class" | "namespace" | "template" | "typename" | "virtual"
-        | "public" | "private" | "protected" | "this" | "new" | "delete"
-        | "true" | "false" | "nullptr" | "try" | "catch" | "throw"
+            | "default" | "do" | "double" | "else" | "enum" | "extern"
+            | "float" | "for" | "goto" | "if" | "inline" | "int" | "long"
+            | "register" | "restrict" | "return" | "short" | "signed"
+            | "sizeof" | "static" | "struct" | "switch" | "typedef"
+            | "union" | "unsigned" | "void" | "volatile" | "while"
+            | "class" | "namespace" | "template" | "typename" | "virtual"
+            | "public" | "private" | "protected" | "this" | "new" | "delete"
+            | "true" | "false" | "nullptr" | "try" | "catch" | "throw"
     )
 }
 
-fn is_type_ctx(kind: &str) -> bool {
+pub(super) fn is_type_ctx(kind: &str) -> bool {
     matches!(
         kind,
         "type_identifier" | "struct_specifier" | "enum_specifier"
-        | "class_specifier" | "enum_identifier" | "primitive_type"
-        | "sized_type_specifier"
+            | "class_specifier" | "enum_identifier" | "primitive_type"
+            | "sized_type_specifier"
     )
 }
 
-fn is_def_ctx(kind: &str) -> bool {
+pub(super) fn is_def_ctx(kind: &str) -> bool {
     matches!(
         kind,
         "declaration" | "type_definition" | "function_definition"
-        | "field_declaration" | "enum_specifier" | "struct_specifier"
-        | "class_specifier" | "namespace_definition" | "parameter_declaration"
-        | "init_declarator" | "field_declarator" | "enumerator"
+            | "field_declaration" | "enum_specifier" | "struct_specifier"
+            | "class_specifier" | "namespace_definition" | "parameter_declaration"
+            | "init_declarator" | "field_declarator" | "enumerator"
     )
 }

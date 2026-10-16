@@ -1,7 +1,10 @@
-use rusqlite::{params, OptionalExtension};
+use std::collections::HashMap;
 
-use crate::model::Symbol;
+use rusqlite::params;
 
+use crate::model::{ScopeKind, Symbol, SymbolKind};
+
+use super::schema;
 use super::store::DbStore;
 
 pub struct QueryResult {
@@ -9,134 +12,203 @@ pub struct QueryResult {
     pub file_path: String,
 }
 
+/// Column list selected by every symbol query (order matters for row_to_symbol).
+const SYM_COLS: &str = "s.id, sn.text, sq.text, s.kind, s.flags, s.file_id, \
+     s.line_start, s.line_end, s.col_start, s.col_end, s.sel_line, s.sel_col, \
+     s.scope_kind, s.scope_depth, s.parent_id, sc.text, f.path";
+
+const SYM_JOINS: &str = "FROM symbols s \
+     JOIN strings sn ON s.name_id = sn.id \
+     JOIN strings sq ON s.qual_id = sq.id \
+     LEFT JOIN strings sc ON s.container_id = sc.id \
+     JOIN files f ON s.file_id = f.id";
+
+/// Lazily-read source files, cached for the duration of a query so display text
+/// (signature / documentation / context line) can be reconstructed on demand
+/// instead of being stored in the DB.
+struct LineCache {
+    files: HashMap<String, Vec<String>>,
+}
+
+impl LineCache {
+    fn new() -> Self {
+        Self { files: HashMap::new() }
+    }
+    fn lines(&mut self, path: &str) -> &[String] {
+        if !self.files.contains_key(path) {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+            self.files.insert(path.to_string(), lines);
+        }
+        self.files.get(path).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
+/// Reconstruct the declaration/signature text starting at `line_start`.
+fn build_signature(lines: &[String], line_start: usize) -> Option<String> {
+    let mut out = String::new();
+    let end = (line_start + 8).min(lines.len());
+    for i in line_start..end {
+        let l = lines[i].trim();
+        if l.is_empty() {
+            continue;
+        }
+        if let Some(brace) = l.find('{') {
+            out.push_str(l[..brace].trim());
+            break;
+        }
+        if let Some(semi) = l.find(';') {
+            out.push_str(l[..=semi].trim());
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(l);
+    }
+    let t = out.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Reconstruct a preceding comment block as documentation.
+fn build_docs(lines: &[String], line_start: usize) -> Option<String> {
+    if line_start == 0 {
+        return None;
+    }
+    let mut block: Vec<&str> = Vec::new();
+    let mut i = line_start;
+    while i > 0 {
+        let l = lines[i - 1].trim();
+        if l.starts_with("//") {
+            block.push(l.trim_start_matches('/').trim());
+        } else if l.starts_with('*') || l.starts_with("/*") || l.ends_with("*/") {
+            let cleaned = l
+                .trim_start_matches("/*")
+                .trim_start_matches('*')
+                .trim_end_matches("*/")
+                .trim();
+            if !cleaned.is_empty() {
+                block.push(cleaned);
+            }
+        } else {
+            break;
+        }
+        i -= 1;
+    }
+    if block.is_empty() {
+        return None;
+    }
+    block.reverse();
+    Some(block.join("\n"))
+}
+
 impl DbStore {
     // ---- Definition queries ----
 
-    /// Find symbol definitions by name.
     pub fn find_definitions(&self, name: &str) -> anyhow::Result<Vec<QueryResult>> {
-        self.query_symbols("SELECT s.*, f.path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.name = ?", params![name])
+        let sql = format!(
+            "SELECT {} {} WHERE sn.text = ? ORDER BY (s.flags & 1) DESC, f.path",
+            SYM_COLS, SYM_JOINS
+        );
+        self.query_symbols(&sql, params![name])
     }
 
-    /// Find symbol definition at a specific file position.
     pub fn find_definition_at(
         &self,
         file_path: &str,
         line: u32,
         column: u32,
     ) -> anyhow::Result<Option<QueryResult>> {
-        let results = self.query_symbols(
-            "SELECT s.*, f.path FROM symbols s JOIN files f ON s.file_id = f.id
-             WHERE f.path = ? AND s.line_start <= ? AND s.line_end >= ? AND s.column_start <= ? AND s.column_end >= ?",
-            params![file_path, line as i32, line as i32, column as i32, column as i32],
-        )?;
+        let sql = format!(
+            "SELECT {} {} WHERE f.path = ? AND s.line_start <= ? AND s.line_end >= ? \
+             AND s.col_start <= ? AND s.col_end >= ? \
+             ORDER BY (s.line_end - s.line_start) ASC LIMIT 1",
+            SYM_COLS, SYM_JOINS
+        );
+        let l = line as i64;
+        let c = column as i64;
+        let mut results = self.query_symbols(&sql, params![file_path, l, l, c, c])?;
         Ok(results.into_iter().next())
     }
 
-    /// Find struct/class members.
     pub fn find_struct_members(&self, struct_name: &str) -> anyhow::Result<Vec<QueryResult>> {
-        // Find the struct symbol
-        let struct_symbols = self.query_symbols(
-            "SELECT s.*, f.path FROM symbols s JOIN files f ON s.file_id = f.id
-             WHERE s.name = ? AND s.kind IN ('struct', 'class', 'union')",
-            params![struct_name],
-        )?;
-
-        let mut all_members = Vec::new();
-        for ss in struct_symbols {
-            let struct_id = ss.symbol.id.unwrap_or(0);
-            let members = self.query_symbols(
-                "SELECT s.*, f.path FROM symbols s
-                 JOIN struct_members sm ON s.id = sm.member_symbol_id
-                 JOIN files f ON s.file_id = f.id
-                 WHERE sm.struct_symbol_id = ?
-                 ORDER BY sm.member_index",
-                params![struct_id],
-            )?;
-            all_members.extend(members);
-        }
-        Ok(all_members)
+        // Members are symbols whose container name matches the aggregate name.
+        let sql = format!(
+            "SELECT {} {} WHERE sc.text = ? ORDER BY f.path, s.line_start",
+            SYM_COLS, SYM_JOINS
+        );
+        self.query_symbols(&sql, params![struct_name])
     }
 
     // ---- Reference queries ----
 
-    /// Find all references to a symbol by name.
-    pub fn find_references(&self, name: &str) -> anyhow::Result<Vec<(i64, String, u32, u32, String, String)>> {
+    pub fn find_references(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Vec<(i64, String, u32, u32, String, String)>> {
         let mut stmt = self.conn.prepare(
-            r#"SELECT r.symbol_id, f.path, r.line, r.column, r.ref_kind, COALESCE(r.context_line, '')
-             FROM "references" r
-             JOIN files f ON r.file_id = f.id
-             WHERE r.symbol_name = ?
-             ORDER BY f.path, r.line"#
+            "SELECT f.path, r.line, r.col, r.kind FROM refs r \
+             JOIN strings sn ON r.name_id = sn.id \
+             JOIN files f ON r.file_id = f.id \
+             WHERE sn.text = ? ORDER BY f.path, r.line",
         )?;
-
-        let mut results = Vec::new();
         let mut rows = stmt.query(params![name])?;
+        let mut raw: Vec<(String, u32, u32, i64)> = Vec::new();
         while let Some(row) = rows.next()? {
-            let symbol_id: i64 = row.get(0)?;
-            let file_path: String = row.get(1)?;
-            let line: u32 = row.get(2)?;
-            let column: u32 = row.get(3)?;
-            let ref_kind: String = row.get(4)?;
-            let context_line: String = row.get(5)?;
-            results.push((symbol_id, file_path, line, column, ref_kind, context_line));
+            raw.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
         }
-        Ok(results)
+        drop(rows);
+
+        let mut cache = LineCache::new();
+        let mut out = Vec::with_capacity(raw.len());
+        for (path, line, col, kind) in raw {
+            let ctx = cache
+                .lines(&path)
+                .get(line as usize)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let kind_str = schema::refkind_from_int(kind).as_str().to_string();
+            out.push((0i64, path, line, col, kind_str, ctx));
+        }
+        Ok(out)
     }
 
-    /// Find references to a specific struct member.
     pub fn find_member_references(
         &self,
-        struct_name: &str,
+        _struct_name: &str,
         member_name: &str,
     ) -> anyhow::Result<Vec<(String, u32, u32, String)>> {
-        // Find struct ID
-        let struct_id: Option<i64> = self.conn.query_row(
-            "SELECT s.id FROM symbols s WHERE s.name = ? AND s.kind IN ('struct', 'class', 'union') LIMIT 1",
-            params![struct_name],
-            |r| r.get(0),
-        ).optional()?;
-
-        let struct_id = match struct_id {
-            Some(id) => id,
-            None => return Ok(Vec::new()),
-        };
-
-        // Find member symbol ID
-        let member_id: Option<i64> = self.conn.query_row(
-            "SELECT sm.member_symbol_id FROM struct_members sm WHERE sm.struct_symbol_id = ?
-             JOIN symbols s ON sm.member_symbol_id = s.id WHERE s.name = ? LIMIT 1",
-            params![struct_id, member_name],
-            |r| r.get(0),
-        ).optional()?;
-
-        let member_id = match member_id {
-            Some(id) => id,
-            None => return Ok(Vec::new()),
-        };
-
         let mut stmt = self.conn.prepare(
-            r#"SELECT f.path, r.line, r.column, COALESCE(r.context_line, '')
-             FROM "references" r
-             JOIN files f ON r.file_id = f.id
-             WHERE r.symbol_id = ?
-             ORDER BY f.path, r.line"#
+            "SELECT f.path, r.line, r.col FROM refs r \
+             JOIN strings sn ON r.name_id = sn.id \
+             JOIN files f ON r.file_id = f.id \
+             WHERE sn.text = ? ORDER BY f.path, r.line",
         )?;
-
-        let mut results = Vec::new();
-        let mut rows = stmt.query(params![member_id])?;
+        let mut rows = stmt.query(params![member_name])?;
+        let mut raw: Vec<(String, u32, u32)> = Vec::new();
         while let Some(row) = rows.next()? {
-            let file_path: String = row.get(0)?;
-            let line: u32 = row.get(1)?;
-            let column: u32 = row.get(2)?;
-            let context_line: String = row.get(3)?;
-            results.push((file_path, line, column, context_line));
+            raw.push((row.get(0)?, row.get(1)?, row.get(2)?));
         }
-        Ok(results)
+        drop(rows);
+        let mut cache = LineCache::new();
+        let mut out = Vec::with_capacity(raw.len());
+        for (path, line, col) in raw {
+            let ctx = cache
+                .lines(&path)
+                .get(line as usize)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            out.push((path, line, col, ctx));
+        }
+        Ok(out)
     }
 
     // ---- Symbol listing ----
 
-    /// List all symbols with optional filters.
     pub fn list_symbols(
         &self,
         kind_filter: Option<&str>,
@@ -144,318 +216,215 @@ impl DbStore {
         scope_filter: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<Vec<QueryResult>> {
-        let mut query = String::from(
-            "SELECT s.*, f.path FROM symbols s JOIN files f ON s.file_id = f.id WHERE 1=1"
-        );
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
+        let mut sql = format!("SELECT {} {} WHERE 1=1", SYM_COLS, SYM_JOINS);
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(kind) = kind_filter {
-            query.push_str(" AND s.kind = ?");
-            params_vec.push(Box::new(kind.to_string()));
+            sql.push_str(" AND s.kind = ?");
+            args.push(Box::new(schema::kind_to_int(kind)));
         }
         if let Some(file) = file_filter {
-            query.push_str(" AND f.path = ?");
-            params_vec.push(Box::new(file.to_string()));
+            sql.push_str(" AND f.path = ?");
+            args.push(Box::new(file.to_string()));
         }
         if let Some(scope) = scope_filter {
-            query.push_str(" AND s.container_name = ?");
-            params_vec.push(Box::new(scope.to_string()));
+            sql.push_str(" AND sc.text = ?");
+            args.push(Box::new(scope.to_string()));
         }
-        query.push_str(" ORDER BY f.path, s.line_start LIMIT ?");
-        params_vec.push(Box::new(limit as i32));
-
-        self.query_symbols(&query, rusqlite::params_from_iter(params_vec))
+        sql.push_str(" ORDER BY f.path, s.line_start LIMIT ?");
+        args.push(Box::new(limit as i64));
+        self.query_symbols(&sql, rusqlite::params_from_iter(args))
     }
 
-    /// Workspace symbol search (FTS).
     pub fn workspace_symbols(&self, query: &str, limit: usize) -> anyhow::Result<Vec<QueryResult>> {
-        self.query_symbols(
-            "SELECT s.*, f.path FROM symbols_fts
-             JOIN symbols s ON s.id = symbols_fts.rowid
-             JOIN files f ON s.file_id = f.id
-             WHERE symbols_fts MATCH ?
-             ORDER BY rank
-             LIMIT ?",
-            params![query, limit as i32],
-        )
+        let sql = format!(
+            "SELECT {} FROM symbols_fts \
+             JOIN symbols s ON s.id = symbols_fts.rowid \
+             JOIN strings sn ON s.name_id = sn.id \
+             JOIN strings sq ON s.qual_id = sq.id \
+             LEFT JOIN strings sc ON s.container_id = sc.id \
+             JOIN files f ON s.file_id = f.id \
+             WHERE symbols_fts MATCH ? ORDER BY rank LIMIT ?",
+            SYM_COLS
+        );
+        self.query_symbols(&sql, params![query, limit as i64])
     }
 
-    /// Document symbols (outline for a file).
     pub fn document_symbols(&self, file_path: &str) -> anyhow::Result<Vec<QueryResult>> {
-        self.query_symbols(
-            "SELECT s.*, f.path FROM symbols s JOIN files f ON s.file_id = f.id
-             WHERE f.path = ? ORDER BY s.line_start",
-            params![file_path],
-        )
+        let sql = format!(
+            "SELECT {} {} WHERE f.path = ? ORDER BY s.line_start",
+            SYM_COLS, SYM_JOINS
+        );
+        self.query_symbols(&sql, params![file_path])
     }
 
     // ---- Call graph ----
 
-    pub fn find_callers(&self, func_name: &str, max_depth: u32) -> anyhow::Result<Vec<(String, String, u32)>> {
-        let func_ids: Vec<i64> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id FROM symbols WHERE name = ? AND kind IN ('function', 'method', 'constructor')"
-            )?;
-            let mut rows = stmt.query(params![func_name])?;
-            let mut ids = Vec::new();
-            while let Some(row) = rows.next()? {
-                ids.push(row.get::<_, i64>(0)?);
-            }
-            ids
-        };
-
-        if func_ids.is_empty() {
-            return Ok(Vec::new());
+    pub fn find_callers(&self, func_name: &str, _max_depth: u32) -> anyhow::Result<Vec<(String, String, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, sc.text, ce.line FROM call_edges ce \
+             JOIN strings sc ON ce.caller_id = sc.id \
+             JOIN strings se ON ce.callee_id = se.id \
+             JOIN files f ON ce.file_id = f.id \
+             WHERE se.text = ? ORDER BY f.path, ce.line",
+        )?;
+        let mut rows = stmt.query(params![func_name])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push((row.get(0)?, row.get(1)?, row.get(2)?));
         }
-
-        let mut callers = Vec::new();
-        for callee_id in &func_ids {
-            let placeholders: String = func_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let mut stmt = self.conn.prepare(&format!(
-                "SELECT f.path, s.name, ce.line FROM call_edges ce
-                 JOIN files f ON ce.file_id = f.id
-                 JOIN symbols s ON ce.caller_symbol_id = s.id
-                 WHERE ce.callee_symbol_id IN ({}) ORDER BY f.path, ce.line",
-                placeholders
-            ))?;
-            let mut rows = stmt.query(rusqlite::params_from_iter(func_ids.clone()))?;
-            while let Some(row) = rows.next()? {
-                let file: String = row.get(0)?;
-                let caller: String = row.get(1)?;
-                let line: u32 = row.get(2)?;
-                callers.push((file, caller, line));
-            }
-        }
-        Ok(callers)
+        Ok(out)
     }
 
     pub fn find_callees(&self, func_name: &str) -> anyhow::Result<Vec<(String, u32, String)>> {
-        let func_ids: Vec<i64> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id FROM symbols WHERE name = ? AND kind IN ('function', 'method', 'constructor')"
-            )?;
-            let mut rows = stmt.query(params![func_name])?;
-            let mut ids = Vec::new();
-            while let Some(row) = rows.next()? {
-                ids.push(row.get::<_, i64>(0)?);
-            }
-            ids
-        };
-
-        if func_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut callees = Vec::new();
-        let placeholders: String = func_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT f.path, ce.line, s.name FROM call_edges ce
-             JOIN files f ON ce.file_id = f.id
-             JOIN symbols s ON ce.callee_symbol_id = s.id
-             WHERE ce.caller_symbol_id IN ({}) ORDER BY f.path, ce.line",
-            placeholders
-        ))?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(func_ids))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, ce.line, se.text FROM call_edges ce \
+             JOIN strings sc ON ce.caller_id = sc.id \
+             JOIN strings se ON ce.callee_id = se.id \
+             JOIN files f ON ce.file_id = f.id \
+             WHERE sc.text = ? ORDER BY f.path, ce.line",
+        )?;
+        let mut rows = stmt.query(params![func_name])?;
+        let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            let file: String = row.get(0)?;
-            let line: u32 = row.get(1)?;
-            let callee: String = row.get(2)?;
-            callees.push((file, line, callee));
+            out.push((row.get(0)?, row.get(1)?, row.get(2)?));
         }
-        Ok(callees)
+        Ok(out)
     }
 
     // ---- Include queries ----
 
     pub fn find_includes(&self, file_path: &str) -> anyhow::Result<Vec<(String, u32)>> {
-        let file_id: Option<i64> = self.get_file_id(file_path)?;
-        let file_id = match file_id {
-            Some(id) => id,
-            None => return Ok(Vec::new()),
+        let Some(file_id) = self.get_file_id(file_path)? else {
+            return Ok(Vec::new());
         };
-
         let mut stmt = self.conn.prepare(
-            "SELECT f.path, i.line FROM includes i JOIN files f ON i.to_file_id = f.id
-             WHERE i.from_file_id = ? ORDER BY i.line"
+            "SELECT f.path, i.line FROM includes i JOIN files f ON i.to_file_id = f.id \
+             WHERE i.from_file_id = ? ORDER BY i.line",
         )?;
         let mut rows = stmt.query(params![file_id])?;
-        let mut results = Vec::new();
+        let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
-            let line: u32 = row.get(1)?;
-            results.push((path, line));
+            out.push((row.get(0)?, row.get(1)?));
         }
-        Ok(results)
+        Ok(out)
     }
 
     pub fn find_included_by(&self, file_path: &str) -> anyhow::Result<Vec<(String, u32)>> {
-        let file_id: Option<i64> = self.get_file_id(file_path)?;
-        let file_id = match file_id {
-            Some(id) => id,
-            None => return Ok(Vec::new()),
+        let Some(file_id) = self.get_file_id(file_path)? else {
+            return Ok(Vec::new());
         };
-
         let mut stmt = self.conn.prepare(
-            "SELECT f.path, i.line FROM includes i JOIN files f ON i.from_file_id = f.id
-             WHERE i.to_file_id = ? ORDER BY f.path, i.line"
+            "SELECT f.path, i.line FROM includes i JOIN files f ON i.from_file_id = f.id \
+             WHERE i.to_file_id = ? ORDER BY f.path, i.line",
         )?;
         let mut rows = stmt.query(params![file_id])?;
-        let mut results = Vec::new();
+        let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
-            let line: u32 = row.get(1)?;
-            results.push((path, line));
+            out.push((row.get(0)?, row.get(1)?));
         }
-        Ok(results)
+        Ok(out)
     }
 
     // ---- Symbol info ----
 
     pub fn symbol_info(&self, name: &str) -> anyhow::Result<Vec<QueryResult>> {
-        self.query_definitions(name)
-    }
-
-    fn query_definitions(&self, name: &str) -> anyhow::Result<Vec<QueryResult>> {
-        self.query_symbols(
-            "SELECT s.*, f.path FROM symbols s JOIN files f ON s.file_id = f.id
-             WHERE s.name = ? ORDER BY s.kind, f.path",
-            params![name],
-        )
+        let sql = format!(
+            "SELECT {} {} WHERE sn.text = ? ORDER BY s.kind, f.path",
+            SYM_COLS, SYM_JOINS
+        );
+        self.query_symbols(&sql, params![name])
     }
 
     // ---- Internal helpers ----
 
-    fn query_symbols<P>(
-        &self,
-        sql: &str,
-        params: P,
-    ) -> anyhow::Result<Vec<QueryResult>>
+    fn query_symbols<P>(&self, sql: &str, params: P) -> anyhow::Result<Vec<QueryResult>>
     where
         P: rusqlite::Params,
     {
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query(params)?;
         let mut results = Vec::new();
-
         while let Some(row) = rows.next()? {
-            let sym = Self::row_to_symbol(row)?;
-            results.push(sym);
+            results.push(Self::row_to_symbol(row)?);
         }
+        drop(rows);
+        self.hydrate(&mut results);
         Ok(results)
+    }
+
+    /// Fill in display-only text (signature, documentation) from source files.
+    fn hydrate(&self, results: &mut [QueryResult]) {
+        let mut cache = LineCache::new();
+        for r in results.iter_mut() {
+            let path = r.file_path.clone();
+            let ls = r.symbol.line_start as usize;
+            let lines = cache.lines(&path);
+            if !lines.is_empty() {
+                if ls < lines.len() {
+                    r.symbol.signature = build_signature(lines, ls);
+                    r.symbol.documentation = build_docs(lines, ls);
+                }
+            }
+        }
     }
 
     fn row_to_symbol(row: &rusqlite::Row) -> anyhow::Result<QueryResult> {
         let id: i64 = row.get(0)?;
         let name: String = row.get(1)?;
         let qualified_name: String = row.get(2)?;
-        let kind_str: String = row.get(3)?;
-        let is_definition: i32 = row.get(4)?;
-        let file_id: i64 = row.get(5)?;
-        let line_start: i32 = row.get(6)?;
-        let line_end: i32 = row.get(7)?;
-        let column_start: i32 = row.get(8)?;
-        let column_end: i32 = row.get(9)?;
-        let selection_line: Option<i32> = row.get(10)?;
-        let selection_column: Option<i32> = row.get(11)?;
-        let scope_kind_str: String = row.get(12)?;
-        let scope_depth: i32 = row.get(13)?;
+        let kind_int: i64 = row.get(3)?;
+        let flags: i64 = row.get(4)?;
+        let _file_id: i64 = row.get(5)?;
+        let line_start: i64 = row.get(6)?;
+        let line_end: i64 = row.get(7)?;
+        let column_start: i64 = row.get(8)?;
+        let column_end: i64 = row.get(9)?;
+        let sel_line: Option<i64> = row.get(10)?;
+        let sel_col: Option<i64> = row.get(11)?;
+        let scope_kind_int: i64 = row.get(12)?;
+        let scope_depth: i64 = row.get(13)?;
         let parent_symbol_id: Option<i64> = row.get(14)?;
         let container_name: Option<String> = row.get(15)?;
-        let declared_type: Option<String> = row.get(16)?;
-        let resolved_type: Option<String> = row.get(17)?;
-        let return_type: Option<String> = row.get(18)?;
-        let signature: Option<String> = row.get(19)?;
-        let access_modifier: Option<String> = row.get(20)?;
-        let storage_class: Option<String> = row.get(21)?;
-        let linkage: Option<String> = row.get(22)?;
-        let is_virtual: i32 = row.get(23)?;
-        let is_override: i32 = row.get(24)?;
-        let is_final: i32 = row.get(25)?;
-        let is_const_method: i32 = row.get(26)?;
-        let base_classes: Option<String> = row.get(27)?;
-        let template_params: Option<String> = row.get(28)?;
-        let declaration_text: Option<String> = row.get(29)?;
-        let definition_text: Option<String> = row.get(30)?;
-        let documentation: Option<String> = row.get(31)?;
-        let _lsp_kind: i32 = row.get(32)?;
-        let file_path: String = row.get(33)?;
+        let file_path: String = row.get(16)?;
 
-        let kind = match kind_str.as_str() {
-            "function" => crate::model::SymbolKind::Function,
-            "method" => crate::model::SymbolKind::Method,
-            "constructor" => crate::model::SymbolKind::Constructor,
-            "destructor" => crate::model::SymbolKind::Destructor,
-            "operator" => crate::model::SymbolKind::Operator,
-            "lambda" => crate::model::SymbolKind::Lambda,
-            "parameter" => crate::model::SymbolKind::Parameter,
-            "variable" => crate::model::SymbolKind::Variable,
-            "local_variable" => crate::model::SymbolKind::LocalVariable,
-            "member" => crate::model::SymbolKind::Member,
-            "static_member" => crate::model::SymbolKind::StaticMember,
-            "struct" => crate::model::SymbolKind::Struct,
-            "class" => crate::model::SymbolKind::Class,
-            "union" => crate::model::SymbolKind::Union,
-            "enum" => crate::model::SymbolKind::Enum,
-            "enum_value" => crate::model::SymbolKind::EnumValue,
-            "typedef" => crate::model::SymbolKind::Typedef,
-            "using_alias" => crate::model::SymbolKind::UsingAlias,
-            "namespace" => crate::model::SymbolKind::Namespace,
-            "macro" => crate::model::SymbolKind::Macro,
-            "label" => crate::model::SymbolKind::Label,
-            "template" => crate::model::SymbolKind::Template,
-            _ => crate::model::SymbolKind::Variable,
-        };
+        let kind: SymbolKind = schema::kind_from_int(kind_int);
+        let scope_kind: ScopeKind = schema::scope_from_int(scope_kind_int);
 
-        let scope_kind = match scope_kind_str.as_str() {
-            "global" => crate::model::ScopeKind::Global,
-            "namespace" => crate::model::ScopeKind::Namespace,
-            "class" => crate::model::ScopeKind::Class,
-            "struct" => crate::model::ScopeKind::Struct,
-            "union" => crate::model::ScopeKind::Union,
-            "enum" => crate::model::ScopeKind::Enum,
-            "function" => crate::model::ScopeKind::Function,
-            "block" => crate::model::ScopeKind::Block,
-            _ => crate::model::ScopeKind::Global,
-        };
-
-        let sym = crate::model::Symbol {
+        let sym = Symbol {
             id: Some(id),
             name,
             qualified_name,
             kind,
-            is_definition: is_definition != 0,
+            is_definition: flags & schema::F_SYMBOL_IS_DEF != 0,
             file_path: file_path.clone(),
             line_start: line_start as u32,
             line_end: line_end as u32,
             column_start: column_start as u32,
             column_end: column_end as u32,
-            selection_line: selection_line.map(|v| v as u32),
-            selection_column: selection_column.map(|v| v as u32),
+            selection_line: sel_line.map(|v| v as u32),
+            selection_column: sel_col.map(|v| v as u32),
             scope_kind,
             scope_depth: scope_depth as u32,
             parent_symbol_id,
             container_name,
-            declared_type,
-            resolved_type,
-            return_type,
-            signature,
-            access_modifier,
-            storage_class,
-            linkage,
-            is_virtual: is_virtual != 0,
-            is_override: is_override != 0,
-            is_final: is_final != 0,
-            is_const_method: is_const_method != 0,
-            base_classes: base_classes.and_then(|s| serde_json::from_str(&s).ok()),
-            template_params: template_params.and_then(|s| serde_json::from_str(&s).ok()),
-            declaration_text,
-            definition_text,
-            documentation,
+            declared_type: None,
+            resolved_type: None,
+            return_type: None,
+            signature: None,
+            access_modifier: None,
+            storage_class: None,
+            linkage: None,
+            is_virtual: flags & schema::F_SYMBOL_VIRTUAL != 0,
+            is_override: flags & schema::F_SYMBOL_OVERRIDE != 0,
+            is_final: flags & schema::F_SYMBOL_FINAL != 0,
+            is_const_method: flags & schema::F_SYMBOL_CONST != 0,
+            base_classes: None,
+            template_params: None,
+            declaration_text: None,
+            definition_text: None,
+            documentation: None,
         };
 
-        Ok(QueryResult {
-            symbol: sym,
-            file_path,
-        })
+        Ok(QueryResult { symbol: sym, file_path })
     }
 }
