@@ -898,10 +898,17 @@ impl SymbolExtractor {
                     .map(|d| self.extract_declarator_name(&d, tree))
                     .unwrap_or_default()
             }
+            // `(*name)(args)` — the inner declarator is an unnamed child, not a
+            // `declarator` field, so peel via named_child(0). Without this,
+            // function-pointer members (`int (*request)(void);`) yield no name
+            // and are dropped entirely.
+            "parenthesized_declarator" => node
+                .named_child(0)
+                .map(|d| self.extract_declarator_name(&d, tree))
+                .unwrap_or_default(),
             "ptr_declarator"
             | "array_declarator"
             | "parameter_list"
-            | "parenthesized_declarator"
             | "attributed_declarator"
             | "pointer_declarator" => {
                 node.child_by_field_name("declarator")

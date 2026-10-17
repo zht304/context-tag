@@ -310,16 +310,21 @@ pub(super) fn resolve_references_with_map(
     // is `struct omap_dm_timer *` becomes `omap_dm_timer::posted`).
     let typedefs = collect_typedefs(tree);
     let var_types = collect_var_types(tree, &typedefs);
-    walk_refs_node(root, tree, scopes, symbol_map, &var_types, &mut references);
+    walk_refs_node(root, tree, scopes, symbol_map, &var_types, &typedefs, None, &mut references);
     references
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_refs_node(
     node: tree_sitter::Node,
     tree: &SourceTree,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
     var_types: &HashMap<String, Option<String>>,
+    typedefs: &HashMap<String, String>,
+    // Struct tag of the aggregate currently being brace-initialized, so
+    // designated initializers (`.field = value`) can be qualified.
+    init_tag: Option<&str>,
     refs: &mut Vec<Reference>,
 ) {
     match node.kind() {
@@ -328,17 +333,21 @@ fn walk_refs_node(
             return;
         }
         "call_expression" => {
-            resolve_ref_call(node, tree, scopes, symbol_map, refs);
-            // resolve_ref_call records the callee; still recurse into the other
-            // children (arguments, or a `a->b()` field callee) so nested member
-            // accesses and identifiers are not dropped.
+            // A plain-identifier callee (`foo()`) is recorded by name. A member
+            // callee (`ops->request()`) is a field_expression, so let the normal
+            // recursion handle it and record the qualified member access instead
+            // of the useless `ops->request` text.
             let func = node.child_by_field_name("function");
+            let plain_callee = func.map(|f| f.kind() == "identifier").unwrap_or(false);
+            if plain_callee {
+                resolve_ref_call(node, tree, scopes, symbol_map, refs);
+            }
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                if func.map(|f| f == child).unwrap_or(false) {
+                if plain_callee && func.map(|f| f == child).unwrap_or(false) {
                     continue;
                 }
-                walk_refs_node(child, tree, scopes, symbol_map, var_types, refs);
+                walk_refs_node(child, tree, scopes, symbol_map, var_types, typedefs, None, refs);
             }
             return;
         }
@@ -348,13 +357,98 @@ fn walk_refs_node(
         "field_expression" => {
             resolve_ref_field(node, tree, scopes, symbol_map, var_types, refs);
         }
+        "initializer_list" => {
+            // The aggregate's type comes from the enclosing declaration; a nested
+            // initializer_list has no cheaply-known member type, so it yields None.
+            let tag = aggregate_tag_for_list(node, tree, typedefs);
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                walk_refs_node(
+                    child, tree, scopes, symbol_map, var_types, typedefs,
+                    tag.as_deref(), refs,
+                );
+            }
+            return;
+        }
+        "initializer_pair" => {
+            resolve_ref_init_pair(node, tree, init_tag, refs);
+            if let Some(value) = node.child_by_field_name("value") {
+                walk_refs_node(value, tree, scopes, symbol_map, var_types, typedefs, None, refs);
+            }
+            return;
+        }
         _ => {}
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_refs_node(child, tree, scopes, symbol_map, var_types, refs);
+        walk_refs_node(child, tree, scopes, symbol_map, var_types, typedefs, init_tag, refs);
     }
+}
+
+/// Resolve the struct tag of the aggregate an `initializer_list` initializes by
+/// walking up to the enclosing declaration. Returns `None` for nested lists
+/// (a member's own aggregate type isn't tracked per-file).
+fn aggregate_tag_for_list(
+    node: tree_sitter::Node,
+    tree: &SourceTree,
+    typedefs: &HashMap<String, String>,
+) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        match p.kind() {
+            "initializer_pair" | "initializer_list" => return None,
+            "declaration" | "field_declaration" | "parameter_declaration" => {
+                return p
+                    .child_by_field_name("type")
+                    .and_then(|t| base_type_tag(t, tree, typedefs));
+            }
+            _ => cur = p.parent(),
+        }
+    }
+    None
+}
+
+/// Record a designated initializer's field (`.request = ...`) as a member
+/// reference, qualified by the initialized struct's tag when known.
+fn resolve_ref_init_pair(
+    node: tree_sitter::Node,
+    tree: &SourceTree,
+    init_tag: Option<&str>,
+    refs: &mut Vec<Reference>,
+) {
+    let designator = match node.child_by_field_name("designator") {
+        Some(d) => d,
+        None => return,
+    };
+    // field_designator wraps a field_identifier; array/subscript designators
+    // ([0] = ...) have no field name and are skipped.
+    let field_ident = match designator.named_child(0) {
+        Some(c) if c.kind() == "field_identifier" => c,
+        _ => return,
+    };
+    let field_name = tree.node_text(&field_ident);
+    let symbol_name = match init_tag {
+        Some(tag) => format!("{}::{}", tag, field_name),
+        None => field_name.to_string(),
+    };
+    let pos = field_ident.start_position();
+    let end_pos = field_ident.end_position();
+    refs.push(Reference {
+        id: None,
+        symbol_id: 0,
+        symbol_name,
+        file_path: tree.file_path().to_string(),
+        line: pos.row as u32,
+        column: pos.column as u32,
+        end_line: Some(end_pos.row as u32),
+        end_column: Some(end_pos.column as u32),
+        ref_kind: crate::model::ReferenceKind::Access,
+        context: Some("member_access".to_string()),
+        context_detail: None,
+        context_line: None,
+        is_definition: false,
+    });
 }
 
 fn resolve_ref_id(
@@ -517,13 +611,14 @@ fn declarator_var_name(node: tree_sitter::Node, tree: &SourceTree) -> Option<Str
         "identifier" | "field_identifier" | "type_identifier" => {
             Some(tree.node_text(&node).to_string())
         }
-        "pointer_declarator"
-        | "array_declarator"
-        | "parenthesized_declarator"
-        | "attributed_declarator"
-        | "init_declarator" => node
-            .child_by_field_name("declarator")
+        // `(*name)(args)` — inner declarator is an unnamed child, not a field.
+        "parenthesized_declarator" => node
+            .named_child(0)
             .and_then(|c| declarator_var_name(c, tree)),
+        "pointer_declarator" | "array_declarator" | "attributed_declarator" | "init_declarator" => {
+            node.child_by_field_name("declarator")
+                .and_then(|c| declarator_var_name(c, tree))
+        }
         _ => None,
     }
 }
