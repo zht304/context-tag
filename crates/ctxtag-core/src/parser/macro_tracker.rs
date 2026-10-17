@@ -31,7 +31,192 @@ impl MacroTracker {
         self.macros.clear();
         self.conditional_stack.clear();
         self.walk_node(tree.root_node(), tree);
+        // tree-sitter's C grammar fails on GCC trailing-attribute macros such as
+        // `void *f(...) __assume_slab_alignment __alloc_size(1);`. The resulting
+        // ERROR node can swallow nearby `#define` directives, so recover any
+        // directives the tree walk missed with a line-based scan (the
+        // preprocessor is line-oriented by nature).
+        self.scan_line_based(tree);
         std::mem::take(&mut self.macros)
+    }
+
+    /// Line-based fallback that captures `#define` directives the tree-sitter
+    /// walk missed (typically those inside or after an ERROR region). Deduped
+    /// against already-recorded macros by start line.
+    fn scan_line_based(&mut self, tree: &SourceTree) {
+        let already: std::collections::HashSet<u32> =
+            self.macros.iter().map(|m| m.line).collect();
+        let src = tree.source_str();
+        let file_path = tree.file_path().to_string();
+        let lines: Vec<&str> = src.lines().collect();
+
+        let mut in_block_comment = false;
+        let mut cond_stack: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        while i < lines.len() {
+            let raw = lines[i];
+            let line_idx = i as u32;
+            let trimmed = raw.trim_start();
+
+            // Cheap block-comment tracking so directives inside `/* ... */`
+            // (e.g. kernel-doc examples) are not mistaken for real defines.
+            if in_block_comment {
+                if let Some(end) = raw.find("*/") {
+                    in_block_comment = false;
+                    let after = &raw[end + 2..];
+                    if !Self::opens_unterminated_comment(after) {
+                        i += 1;
+                        continue;
+                    }
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            let is_directive = trimmed.starts_with('#');
+            if !is_directive {
+                if Self::opens_unterminated_comment(raw) {
+                    in_block_comment = true;
+                }
+                i += 1;
+                continue;
+            }
+
+            // Track conditional context (mirrors the tree-walk behaviour).
+            let after_hash = trimmed[1..].trim_start();
+            if let Some(arg) = after_hash.strip_prefix("ifdef").or_else(|| after_hash.strip_prefix("ifndef")) {
+                let kw = if after_hash.starts_with("ifndef") { "#ifndef" } else { "#ifdef" };
+                let name = arg.trim_start().chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>();
+                cond_stack.push(format!("{} {}", kw, name));
+            } else if after_hash.starts_with("if") && !after_hash.starts_with("ifndef") && !after_hash.starts_with("ifdef") {
+                cond_stack.push("#if".to_string());
+            } else if after_hash.starts_with("elif") {
+                if let Some(top) = cond_stack.last_mut() {
+                    *top = "#elif".to_string();
+                }
+            } else if after_hash.starts_with("else") {
+                if let Some(top) = cond_stack.last_mut() {
+                    *top = "#else".to_string();
+                }
+            } else if after_hash.starts_with("endif") {
+                cond_stack.pop();
+            } else if let Some(rest) = after_hash.strip_prefix("define") {
+                if !already.contains(&line_idx) {
+                    // Assemble the logical line (handle backslash continuations).
+                    let mut logical = String::new();
+                    let mut j = i;
+                    loop {
+                        let l = lines[j];
+                        let cont = l.trim_end().ends_with('\\');
+                        let piece = if cont { l.trim_end().trim_end_matches('\\') } else { l };
+                        if !logical.is_empty() {
+                            logical.push(' ');
+                        }
+                        logical.push_str(piece.trim_end());
+                        if !cont || j + 1 >= lines.len() {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if let Some(m) = Self::parse_define_line(&logical, &file_path, line_idx, &cond_stack) {
+                        self.macros.push(m);
+                    }
+                    // Advance past continuation lines; still track comments on last line.
+                    if Self::opens_unterminated_comment(&logical) {
+                        in_block_comment = true;
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+
+            if Self::opens_unterminated_comment(raw) {
+                in_block_comment = true;
+            }
+            i += 1;
+        }
+    }
+
+    /// True if `s` opens a `/*` block comment that is not closed on the same line.
+    fn opens_unterminated_comment(s: &str) -> bool {
+        let mut depth_open = false;
+        let b = s.as_bytes();
+        let mut k = 0;
+        while k + 1 < b.len() {
+            if !depth_open && b[k] == b'/' && b[k + 1] == b'*' {
+                depth_open = true;
+                k += 2;
+                continue;
+            }
+            if depth_open && b[k] == b'*' && b[k + 1] == b'/' {
+                depth_open = false;
+                k += 2;
+                continue;
+            }
+            // Line comment starts: nothing after can open a block comment.
+            if !depth_open && b[k] == b'/' && b[k + 1] == b'/' {
+                break;
+            }
+            k += 1;
+        }
+        depth_open
+    }
+
+    /// Parse a single (continuation-joined) `#define ...` logical line.
+    fn parse_define_line(
+        logical: &str,
+        file_path: &str,
+        line: u32,
+        cond_stack: &[String],
+    ) -> Option<Macro> {
+        let after_hash = logical.trim_start()[1..].trim_start();
+        let rest = after_hash.strip_prefix("define")?.trim_start();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            return None;
+        }
+        let after_name = &rest[name.len()..];
+        // Function-like only when '(' immediately follows the name (no space).
+        let (is_function_like, params, body) = if after_name.starts_with('(') {
+            match after_name.find(')') {
+                Some(close) => {
+                    let params_str = &after_name[1..close];
+                    let params: Vec<String> = params_str
+                        .split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect();
+                    (true, params, after_name[close + 1..].trim().to_string())
+                }
+                None => (false, Vec::new(), after_name.trim().to_string()),
+            }
+        } else {
+            (false, Vec::new(), after_name.trim().to_string())
+        };
+
+        let conditional_context = if cond_stack.is_empty() {
+            None
+        } else {
+            Some(Value::Array(
+                cond_stack.iter().map(|s| Value::String(s.clone())).collect(),
+            ))
+        };
+
+        Some(Macro {
+            id: None,
+            name,
+            is_function_like,
+            params,
+            body,
+            file_path: file_path.to_string(),
+            line,
+            conditional_context,
+        })
     }
 
     fn walk_node(&mut self, node: Node, tree: &SourceTree) {
