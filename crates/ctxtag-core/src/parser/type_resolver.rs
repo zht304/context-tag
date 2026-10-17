@@ -157,31 +157,20 @@ impl TypeResolver {
 
     // ─── Type String Cleaning ─────────────────────────────────────────
 
-    /// Clean a type string by removing leading keywords and extracting
-    /// the actual type name.
+    /// Clean a type string by removing elaborated-type keywords and
+    /// cv-qualifiers, leaving the bare type name(s).
     fn clean_type_string(&self, type_str: &str) -> String {
-        let cleaned = type_str.trim();
-
-        // Remove common leading keywords
-        let cleaned = cleaned
-            .strip_prefix("struct ")
-            .unwrap_or(cleaned)
-            .strip_prefix("enum ")
-            .unwrap_or(cleaned)
-            .strip_prefix("union ")
-            .unwrap_or(cleaned)
-            .strip_prefix("class ")
-            .unwrap_or(cleaned);
-
-        // Remove const/volatile qualifiers
-        let words: Vec<&str> = cleaned.split_whitespace().collect();
-        let filtered: Vec<&str> = words
-            .iter()
-            .filter(|&&w| !matches!(w, "const" | "volatile" | "restrict" | "inline"))
-            .cloned()
-            .collect();
-
-        filtered.join(" ").trim().to_string()
+        // Word-level filtering so any ordering works (e.g. "const struct Foo").
+        type_str
+            .split_whitespace()
+            .filter(|w| {
+                !matches!(
+                    *w,
+                    "struct" | "enum" | "union" | "class" | "const" | "volatile" | "restrict" | "inline"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Try to extract a simple type name from a complex type descriptor.
@@ -191,26 +180,18 @@ impl TypeResolver {
     /// - "struct Foo" -> "Foo"
     /// - "unsigned long long" -> "unsigned_long_long"
     pub fn extract_simple_type_name(type_str: &str) -> String {
-        let cleaned = type_str
-            .trim()
-            .strip_prefix("struct ")
-            .unwrap_or(type_str)
-            .strip_prefix("enum ")
-            .unwrap_or(type_str)
-            .strip_prefix("union ")
-            .unwrap_or(type_str)
-            .strip_prefix("class ")
-            .unwrap_or(type_str);
+        // Strip trailing pointer/reference indicators, then filter out
+        // elaborated-type keywords and cv-qualifiers at the word level.
+        let cleaned = type_str.trim().trim_end_matches('*').trim_end_matches('&').trim();
 
-        // Remove pointer/reference indicators
-        let cleaned = cleaned.trim_end_matches('*').trim_end_matches('&').trim();
-
-        // Remove const/volatile
-        let words: Vec<&str> = cleaned.split_whitespace().collect();
-        let filtered: Vec<&str> = words
-            .iter()
-            .filter(|&&w| !matches!(w, "const" | "volatile" | "restrict"))
-            .cloned()
+        let filtered: Vec<&str> = cleaned
+            .split_whitespace()
+            .filter(|w| {
+                !matches!(
+                    *w,
+                    "struct" | "enum" | "union" | "class" | "const" | "volatile" | "restrict"
+                )
+            })
             .collect();
 
         // For compound types (e.g., "unsigned int"), join with underscore
@@ -299,5 +280,16 @@ mod tests {
         resolver.build(&symbols);
 
         assert_eq!(resolver.resolve("Point"), "PointImpl");
+    }
+
+    #[test]
+    fn test_extract_simple_type_name() {
+        assert_eq!(TypeResolver::extract_simple_type_name("const int *"), "int");
+        assert_eq!(TypeResolver::extract_simple_type_name("struct Foo"), "Foo");
+        assert_eq!(TypeResolver::extract_simple_type_name("struct Foo *"), "Foo");
+        assert_eq!(
+            TypeResolver::extract_simple_type_name("unsigned long long"),
+            "unsigned_long_long"
+        );
     }
 }
