@@ -312,6 +312,25 @@ fn handle_references(
         }
     }
 
+    // Cursor on a member *definition* (e.g. `int (*set)(...)` inside a struct):
+    // scope references to that struct's member instead of every identifier that
+    // happens to share the name (locals, params, other structs' members).
+    if let Ok(Some(qr)) = store.find_definition_at(&file_path, pos.line, pos.character) {
+        if qr.symbol.kind == ctxtag_core::SymbolKind::Member {
+            if let Some(container) = qr.symbol.container_name.as_deref() {
+                if let Ok(mrefs) = store.find_member_references(container, &qr.symbol.name) {
+                    if !mrefs.is_empty() {
+                        let locations: Vec<Location> = mrefs
+                            .iter()
+                            .map(|(file, line, col, _)| ref_location(file, *line, *col))
+                            .collect();
+                        return send_response(id, Ok(serde_json::to_value(locations)?));
+                    }
+                }
+            }
+        }
+    }
+
     let refs = store.find_references(&word).ok();
     if let Some(refs) = refs {
         let locations: Vec<Location> = refs
