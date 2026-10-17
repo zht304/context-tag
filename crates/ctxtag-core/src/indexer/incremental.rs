@@ -8,7 +8,7 @@ use crate::parser::{
     CallGraph, IncludeTracker, LanguageKind, MacroTracker, ScopeBuilder,
     SourceTree, SymbolExtractor,
 };
-use super::engine::{IndexStats, resolve_references_with_map};
+use super::engine::{GlobalTypes, IndexStats, resolve_references_with_map};
 use super::include_resolver::IncludeResolver;
 
 /// Incremental indexer: detects changed/new/deleted files and re-indexes only those.
@@ -289,7 +289,10 @@ impl<'a> IncrementalIndexer<'a> {
         let scopes = vec![global_scope];
 
         let empty: HashMap<String, i64> = HashMap::new();
-        let references = resolve_references_with_map(&tree, &scopes, &empty);
+        // Single-file reindex lacks the cross-file type tables, so member refs
+        // fall back to same-file inference (as before global tables existed).
+        let references =
+            resolve_references_with_map(&tree, &scopes, &empty, &GlobalTypes::default());
 
         let mut call_graph = CallGraph::new();
         let edges = call_graph.extract(&tree);

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -8,9 +8,9 @@ use tree_sitter::Parser;
 use walkdir::WalkDir;
 
 use crate::db::DbStore;
-use crate::model::{Include, Macro, Reference, Symbol};
+use crate::model::{Include, Macro, Reference, Symbol, SymbolKind};
 use crate::parser::{
-    CallGraph, IncludeTracker, LanguageKind, MacroTracker, SourceTree, SymbolExtractor,
+    CallGraph, IncludeTracker, LanguageKind, MacroTracker, SourceTree, SymbolExtractor, TypeResolver,
 };
 
 use super::include_resolver::IncludeResolver;
@@ -22,7 +22,8 @@ use super::incremental::IncrementalIndexer;
 /// from one tree walk).
 const CHUNK: usize = 128;
 
-/// Everything extracted from one file in a single parse.
+/// Everything extracted from one file in a single parse (pass 1). References
+/// are resolved separately in pass 2 once the global type tables are complete.
 struct FileData {
     path: String,
     content: String,
@@ -30,7 +31,6 @@ struct FileData {
     symbols: Vec<Symbol>,
     macros: Vec<Macro>,
     includes: Vec<Include>,
-    refs: Vec<Reference>,
     calls: Vec<(String, String, u32, u32)>, // caller, callee, line, col
 }
 
@@ -93,9 +93,12 @@ impl IndexEngine {
 
         let mut global_map: HashMap<String, i64> = HashMap::new();
         let mut all_includes: Vec<Include> = Vec::new();
+        let mut type_builder = GlobalTypesBuilder::default();
         let threads = rayon::current_num_threads();
-        tracing::info!("Indexing {} files ({} threads, single pass)", total, threads);
+        tracing::info!("Indexing {} files ({} threads, two passes)", total, threads);
 
+        // ---- Pass 1: symbols, macros, includes, call edges. Accumulate the
+        // cross-file type tables that pass 2 needs to qualify member refs. ----
         for (ci, chunk) in files.chunks(CHUNK).enumerate() {
             let data: Vec<FileData> = chunk
                 .par_iter()
@@ -119,7 +122,6 @@ impl IndexEngine {
             // Move extracted rows out of FileData into per-chunk batches.
             let mut syms: Vec<Symbol> = Vec::new();
             let mut macs: Vec<Macro> = Vec::new();
-            let mut refs: Vec<Reference> = Vec::new();
             let mut calls: Vec<(String, String, String, u32, u32)> = Vec::new();
             for d in data {
                 stats.files_indexed += 1;
@@ -129,17 +131,19 @@ impl IndexEngine {
                 all_includes.extend(d.includes);
                 syms.extend(d.symbols);
                 macs.extend(d.macros);
-                refs.extend(d.refs);
+            }
+
+            for s in &syms {
+                type_builder.feed(s);
             }
 
             stats.symbols_extracted += self.store.batch_insert_symbols(&syms, &fmap)?;
             stats.macros_indexed += self.store.batch_insert_macros(&macs, &fmap)?;
-            stats.references_resolved += self.store.batch_insert_references(&refs, &fmap)?;
             stats.call_edges += self.store.batch_insert_call_edges(&calls, &fmap)?;
 
             if total > 2000 && ci % 20 == 0 {
                 tracing::info!(
-                    "  {}/{} files ({}%)",
+                    "  pass1 {}/{} files ({}%)",
                     stats.files_indexed,
                     total,
                     stats.files_indexed * 100 / total.max(1)
@@ -147,9 +151,35 @@ impl IndexEngine {
             }
         }
 
+        let global = type_builder.finish();
+        tracing::info!(
+            "Global type tables: {} typedef->tag, {} field->type",
+            global.typedef_to_tag.len(),
+            global.field_type.len()
+        );
+
         // Resolve and persist include edges against the full file map.
         let resolved = self.include_resolver.resolve_all(&all_includes, &files);
         stats.includes_resolved = self.store.batch_insert_includes(&resolved, &global_map)?;
+
+        // ---- Pass 2: references, resolved against the complete type tables. ----
+        for (ci, chunk) in files.chunks(CHUNK).enumerate() {
+            let refs: Vec<Reference> = chunk
+                .par_iter()
+                .filter_map(|p| Self::resolve_refs_for_file(p, &global))
+                .flatten()
+                .collect();
+            stats.references_resolved += self.store.batch_insert_references(&refs, &global_map)?;
+
+            if total > 2000 && ci % 20 == 0 {
+                tracing::info!(
+                    "  pass2 {}/{} files ({}%)",
+                    (ci + 1) * CHUNK.min(total),
+                    total,
+                    ((ci + 1) * CHUNK).min(total) * 100 / total.max(1)
+                );
+            }
+        }
 
         if self.config.bulk_mode {
             let idx_start = Instant::now();
@@ -197,12 +227,6 @@ impl IndexEngine {
         let mut include_tracker = IncludeTracker::new();
         let includes = include_tracker.track(&tree);
 
-        // References are resolved by name at query time; pass an empty symbol
-        // map so we emit name-based references without a second parse.
-        let empty: HashMap<String, i64> = HashMap::new();
-        let no_scopes: &[crate::model::Scope] = &[];
-        let refs = resolve_references_with_map(&tree, no_scopes, &empty);
-
         let mut call_graph = CallGraph::new();
         let edges = call_graph.extract(&tree);
         let mut calls = Vec::new();
@@ -221,9 +245,40 @@ impl IndexEngine {
             symbols,
             macros,
             includes,
-            refs,
             calls,
         })
+    }
+
+    /// Pass 2: re-parse one file and resolve references against the completed
+    /// global type tables. Kept separate from `parse_file` because reference
+    /// qualification needs cross-file type info that isn't known until every
+    /// file's symbols have been collected.
+    fn resolve_refs_for_file(path: &str, global: &GlobalTypes) -> Option<Vec<Reference>> {
+        let mut parser = Parser::new();
+        Self::init_parser(&mut parser, path).ok()?;
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to read {}: {}", path, e);
+                return None;
+            }
+        };
+        let language = Self::detect_language(path);
+        let mut tree = match SourceTree::parse_with_parser(&mut parser, language, content.as_bytes())
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to parse {}: {}", path, e);
+                return None;
+            }
+        };
+        tree.set_file_path(path.to_string());
+
+        // References are resolved by name at query time; pass an empty symbol
+        // map so we emit name-based references.
+        let empty: HashMap<String, i64> = HashMap::new();
+        let no_scopes: &[crate::model::Scope] = &[];
+        Some(resolve_references_with_map(&tree, no_scopes, &empty, global))
     }
 
     fn detect_language(file_path: &str) -> LanguageKind {
@@ -298,19 +353,128 @@ pub struct IndexStats {
 
 // ─── Reference Resolution (name-based) ─────────────────────────────────
 
+/// Cross-file type tables used to qualify member references beyond what a
+/// single file's declarations reveal. Built during pass 1 (symbols) and
+/// consumed during pass 2 (references):
+/// - `typedef_to_tag`: alias -> underlying struct/union/class/enum tag. Lets a
+///   receiver declared via a header typedef (e.g. `drm_i915_private *dev`) be
+///   resolved even though the typedef isn't in the same file.
+/// - `field_type`: (struct tag, field name) -> the field's own struct tag, for
+///   fields whose type is a struct/typedef thereof. Enables chained dereference
+///   (`a->b->c`: resolve `a`, look up `b`'s type, then qualify `c`).
+#[derive(Default, Clone)]
+pub struct GlobalTypes {
+    pub typedef_to_tag: HashMap<String, String>,
+    pub field_type: HashMap<(String, String), String>,
+}
+
+/// Mutable accumulator fed with pass-1 symbols. Values are stored as raw core
+/// type names and resolved to real struct tags by `finish`.
+#[derive(Default)]
+struct GlobalTypesBuilder {
+    struct_tags: HashSet<String>,
+    // alias -> core type name (unresolved; may itself be another alias)
+    typedefs: HashMap<String, String>,
+    // (container, field) -> core type name (unresolved)
+    fields: HashMap<(String, String), String>,
+}
+
+impl GlobalTypesBuilder {
+    fn feed(&mut self, sym: &Symbol) {
+        match sym.kind {
+            SymbolKind::Struct | SymbolKind::Union | SymbolKind::Class | SymbolKind::Enum => {
+                if !sym.name.is_empty() {
+                    self.struct_tags.insert(sym.name.clone());
+                }
+            }
+            SymbolKind::Typedef => {
+                if let Some(dt) = &sym.declared_type {
+                    let core = TypeResolver::extract_simple_type_name(dt);
+                    if !core.is_empty() && !sym.name.is_empty() {
+                        self.typedefs.entry(sym.name.clone()).or_insert(core);
+                    }
+                }
+            }
+            SymbolKind::Member | SymbolKind::StaticMember => {
+                if let (Some(container), Some(dt)) = (&sym.container_name, &sym.declared_type) {
+                    if container.is_empty() {
+                        return;
+                    }
+                    let core = TypeResolver::extract_simple_type_name(dt);
+                    if !core.is_empty() {
+                        self.fields
+                            .entry((container.clone(), sym.name.clone()))
+                            .or_insert(core);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve accumulated core names to concrete struct tags. Typedefs are
+    /// followed transitively (alias -> alias -> struct); entries that bottom out
+    /// in a primitive or unknown name are dropped, since they can't qualify a
+    /// member access.
+    fn finish(self) -> GlobalTypes {
+        let mut typedef_to_tag: HashMap<String, String> = HashMap::new();
+        for alias in self.typedefs.keys() {
+            if let Some(tag) = self.resolve_alias(alias, 0) {
+                typedef_to_tag.insert(alias.clone(), tag);
+            }
+        }
+
+        let mut field_type: HashMap<(String, String), String> = HashMap::new();
+        for (key, core) in &self.fields {
+            let resolved = if self.struct_tags.contains(core) {
+                Some(core.clone())
+            } else {
+                typedef_to_tag.get(core).cloned()
+            };
+            if let Some(tag) = resolved {
+                field_type.insert(key.clone(), tag);
+            }
+        }
+
+        GlobalTypes { typedef_to_tag, field_type }
+    }
+
+    fn resolve_alias(&self, alias: &str, depth: usize) -> Option<String> {
+        if depth > 8 {
+            return None;
+        }
+        let core = self.typedefs.get(alias)?;
+        if self.struct_tags.contains(core) {
+            return Some(core.clone());
+        }
+        if self.typedefs.contains_key(core) && core != alias {
+            return self.resolve_alias(core, depth + 1);
+        }
+        None
+    }
+}
+
 pub(super) fn resolve_references_with_map(
     tree: &SourceTree,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
+    global: &GlobalTypes,
 ) -> Vec<Reference> {
     let mut references: Vec<Reference> = Vec::new();
     let root = tree.root_node();
     // Build a per-file variable -> struct-tag map so member accesses can be
     // qualified by their receiver's type (e.g. `timer->posted` where `timer`
-    // is `struct omap_dm_timer *` becomes `omap_dm_timer::posted`).
-    let typedefs = collect_typedefs(tree);
+    // is `struct omap_dm_timer *` becomes `omap_dm_timer::posted`). Per-file
+    // typedefs win; global typedefs fill in aliases defined in other files.
+    let mut typedefs = collect_typedefs(tree);
+    for (alias, tag) in &global.typedef_to_tag {
+        typedefs.entry(alias.clone()).or_insert_with(|| tag.clone());
+    }
     let var_types = collect_var_types(tree, &typedefs);
-    walk_refs_node(root, tree, scopes, symbol_map, &var_types, &typedefs, None, &mut references);
+    walk_refs_node(
+        root, tree, scopes, symbol_map, &var_types, &typedefs, &global.field_type, None,
+        &mut references,
+    );
     references
 }
 
@@ -322,6 +486,7 @@ fn walk_refs_node(
     symbol_map: &HashMap<String, i64>,
     var_types: &HashMap<String, Option<String>>,
     typedefs: &HashMap<String, String>,
+    field_type: &HashMap<(String, String), String>,
     // Struct tag of the aggregate currently being brace-initialized, so
     // designated initializers (`.field = value`) can be qualified.
     init_tag: Option<&str>,
@@ -347,7 +512,9 @@ fn walk_refs_node(
                 if plain_callee && func.map(|f| f == child).unwrap_or(false) {
                     continue;
                 }
-                walk_refs_node(child, tree, scopes, symbol_map, var_types, typedefs, None, refs);
+                walk_refs_node(
+                    child, tree, scopes, symbol_map, var_types, typedefs, field_type, None, refs,
+                );
             }
             return;
         }
@@ -355,7 +522,7 @@ fn walk_refs_node(
             resolve_ref_qualified(node, tree, symbol_map, refs);
         }
         "field_expression" => {
-            resolve_ref_field(node, tree, scopes, symbol_map, var_types, refs);
+            resolve_ref_field(node, tree, scopes, symbol_map, var_types, field_type, refs);
         }
         "initializer_list" => {
             // The aggregate's type comes from the enclosing declaration; a nested
@@ -364,7 +531,7 @@ fn walk_refs_node(
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 walk_refs_node(
-                    child, tree, scopes, symbol_map, var_types, typedefs,
+                    child, tree, scopes, symbol_map, var_types, typedefs, field_type,
                     tag.as_deref(), refs,
                 );
             }
@@ -373,7 +540,9 @@ fn walk_refs_node(
         "initializer_pair" => {
             resolve_ref_init_pair(node, tree, init_tag, refs);
             if let Some(value) = node.child_by_field_name("value") {
-                walk_refs_node(value, tree, scopes, symbol_map, var_types, typedefs, None, refs);
+                walk_refs_node(
+                    value, tree, scopes, symbol_map, var_types, typedefs, field_type, None, refs,
+                );
             }
             return;
         }
@@ -382,7 +551,9 @@ fn walk_refs_node(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_refs_node(child, tree, scopes, symbol_map, var_types, typedefs, init_tag, refs);
+        walk_refs_node(
+            child, tree, scopes, symbol_map, var_types, typedefs, field_type, init_tag, refs,
+        );
     }
 }
 
@@ -552,6 +723,7 @@ fn resolve_ref_field(
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
     var_types: &HashMap<String, Option<String>>,
+    field_type: &HashMap<(String, String), String>,
     refs: &mut Vec<Reference>,
 ) {
     let field = match node.child_by_field_name("field") {
@@ -564,14 +736,13 @@ fn resolve_ref_field(
     let end_pos = field.end_position();
     let is_ptr = tree.node_text(&node).contains("->");
 
-    // Qualify the member by the receiver's struct tag when it can be inferred
-    // within this file, so `Struct.member` queries don't match same-named
-    // members of unrelated structs. Falls back to the bare member name.
+    // Qualify the member by the receiver's struct tag when it can be inferred,
+    // so `Struct.member` queries don't match same-named members of unrelated
+    // structs. The receiver type follows dereference chains (a->b->c) via the
+    // global field-type table. Falls back to the bare member name.
     let recv_tag = node
         .child_by_field_name("argument")
-        .and_then(|op| receiver_var_name(op, tree))
-        .and_then(|var| var_types.get(&var).cloned())
-        .flatten();
+        .and_then(|op| receiver_type_tag(op, tree, var_types, field_type, 0));
     let symbol_name = match recv_tag {
         Some(tag) => format!("{}::{}", tag, field_name),
         None => field_name.to_string(),
@@ -648,18 +819,36 @@ fn base_type_tag(
     }
 }
 
-/// Extract the receiver variable name from a `field_expression` operand.
-/// Handles plain identifiers, `*p` and `(expr)` wrappers; returns `None` for
-/// chained accesses and calls whose type can't be inferred per-file.
-fn receiver_var_name(operand: tree_sitter::Node, tree: &SourceTree) -> Option<String> {
+/// Resolve a `field_expression` operand to its struct tag, following
+/// dereference chains. Plain identifiers use the per-file variable-type map;
+/// nested `a->b` resolves `a`'s tag then looks up `b`'s type in the global
+/// field-type table. `*p` and `(expr)` wrappers are peeled. Returns `None` for
+/// calls and other expressions whose type isn't tracked.
+fn receiver_type_tag(
+    operand: tree_sitter::Node,
+    tree: &SourceTree,
+    var_types: &HashMap<String, Option<String>>,
+    field_type: &HashMap<(String, String), String>,
+    depth: usize,
+) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
     match operand.kind() {
-        "identifier" => Some(tree.node_text(&operand).to_string()),
-        "pointer_expression" => operand
+        "identifier" => {
+            let name = tree.node_text(&operand);
+            var_types.get(name).cloned().flatten()
+        }
+        "pointer_expression" | "parenthesized_expression" => operand
             .named_child(0)
-            .and_then(|c| receiver_var_name(c, tree)),
-        "parenthesized_expression" => operand
-            .named_child(0)
-            .and_then(|c| receiver_var_name(c, tree)),
+            .and_then(|c| receiver_type_tag(c, tree, var_types, field_type, depth + 1)),
+        "field_expression" => {
+            let arg = operand.child_by_field_name("argument")?;
+            let field = operand.child_by_field_name("field")?;
+            let base = receiver_type_tag(arg, tree, var_types, field_type, depth + 1)?;
+            let field_name = tree.node_text(&field);
+            field_type.get(&(base, field_name.to_string())).cloned()
+        }
         _ => None,
     }
 }
