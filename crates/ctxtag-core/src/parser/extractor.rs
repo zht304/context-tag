@@ -244,9 +244,9 @@ impl SymbolExtractor {
     // ─── Type Definitions ─────────────────────────────────────────────
 
     fn extract_type_definition(&mut self, node: Node, tree: &SourceTree) {
-        // type_definition -> decl_type (contains type_descriptor) + declarator
+        // type_definition -> type (the aliased type) + declarator
         let declarator = node.child_by_field_name("declarator");
-        let decl_type = node.child_by_field_name("decl_type");
+        let decl_type = node.child_by_field_name("type");
 
         if let Some(decl) = declarator {
             let name = self.extract_declarator_name(&decl, tree);
