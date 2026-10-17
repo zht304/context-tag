@@ -136,6 +136,9 @@ impl IndexEngine {
             for s in &syms {
                 type_builder.feed(s);
             }
+            for m in &macs {
+                type_builder.feed_macro(&m.name);
+            }
 
             stats.symbols_extracted += self.store.batch_insert_symbols(&syms, &fmap)?;
             stats.macros_indexed += self.store.batch_insert_macros(&macs, &fmap)?;
@@ -366,6 +369,11 @@ pub struct IndexStats {
 pub struct GlobalTypes {
     pub typedef_to_tag: HashMap<String, String>,
     pub field_type: HashMap<(String, String), String>,
+    /// Every name bound to a file-scope symbol or macro anywhere in the project.
+    /// Used to decide whether a plain-identifier reference could denote a
+    /// global; a name absent from this set that is also a function local is a
+    /// pure local and its references are not stored.
+    pub global_names: HashSet<String>,
 }
 
 /// Mutable accumulator fed with pass-1 symbols. Values are stored as raw core
@@ -377,10 +385,14 @@ struct GlobalTypesBuilder {
     typedefs: HashMap<String, String>,
     // (container, field) -> core type name (unresolved)
     fields: HashMap<(String, String), String>,
+    global_names: HashSet<String>,
 }
 
 impl GlobalTypesBuilder {
     fn feed(&mut self, sym: &Symbol) {
+        if !sym.name.is_empty() {
+            self.global_names.insert(sym.name.clone());
+        }
         match sym.kind {
             SymbolKind::Struct | SymbolKind::Union | SymbolKind::Class | SymbolKind::Enum => {
                 if !sym.name.is_empty() {
@@ -412,6 +424,12 @@ impl GlobalTypesBuilder {
         }
     }
 
+    fn feed_macro(&mut self, name: &str) {
+        if !name.is_empty() {
+            self.global_names.insert(name.to_string());
+        }
+    }
+
     /// Resolve accumulated core names to concrete struct tags. Typedefs are
     /// followed transitively (alias -> alias -> struct); entries that bottom out
     /// in a primitive or unknown name are dropped, since they can't qualify a
@@ -436,7 +454,7 @@ impl GlobalTypesBuilder {
             }
         }
 
-        GlobalTypes { typedef_to_tag, field_type }
+        GlobalTypes { typedef_to_tag, field_type, global_names: self.global_names }
     }
 
     fn resolve_alias(&self, alias: &str, depth: usize) -> Option<String> {
@@ -471,8 +489,9 @@ pub(super) fn resolve_references_with_map(
         typedefs.entry(alias.clone()).or_insert_with(|| tag.clone());
     }
     let var_types = collect_var_types(tree, &typedefs);
+    let no_locals: HashSet<String> = HashSet::new();
     walk_refs_node(
-        root, tree, scopes, symbol_map, &var_types, &typedefs, &global.field_type, None,
+        root, tree, scopes, symbol_map, &var_types, &typedefs, global, &no_locals, None,
         &mut references,
     );
     references
@@ -486,15 +505,31 @@ fn walk_refs_node(
     symbol_map: &HashMap<String, i64>,
     var_types: &HashMap<String, Option<String>>,
     typedefs: &HashMap<String, String>,
-    field_type: &HashMap<(String, String), String>,
+    global: &GlobalTypes,
+    // Names bound as locals/parameters of the enclosing function. References to
+    // a name in this set that is not also a global are pure-local and skipped.
+    locals: &HashSet<String>,
     // Struct tag of the aggregate currently being brace-initialized, so
     // designated initializers (`.field = value`) can be qualified.
     init_tag: Option<&str>,
     refs: &mut Vec<Reference>,
 ) {
     match node.kind() {
+        "function_definition" => {
+            // C/C++ functions don't nest, so the whole subtree shares one local
+            // set computed from the parameters and body declarations.
+            let fn_locals = collect_function_locals(node, tree);
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                walk_refs_node(
+                    child, tree, scopes, symbol_map, var_types, typedefs, global, &fn_locals,
+                    init_tag, refs,
+                );
+            }
+            return;
+        }
         "identifier" => {
-            resolve_ref_id(node, tree, scopes, symbol_map, refs);
+            resolve_ref_id(node, tree, scopes, symbol_map, locals, &global.global_names, refs);
             return;
         }
         "call_expression" => {
@@ -505,7 +540,7 @@ fn walk_refs_node(
             let func = node.child_by_field_name("function");
             let plain_callee = func.map(|f| f.kind() == "identifier").unwrap_or(false);
             if plain_callee {
-                resolve_ref_call(node, tree, scopes, symbol_map, refs);
+                resolve_ref_call(node, tree, scopes, symbol_map, locals, &global.global_names, refs);
             }
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
@@ -513,7 +548,7 @@ fn walk_refs_node(
                     continue;
                 }
                 walk_refs_node(
-                    child, tree, scopes, symbol_map, var_types, typedefs, field_type, None, refs,
+                    child, tree, scopes, symbol_map, var_types, typedefs, global, locals, None, refs,
                 );
             }
             return;
@@ -522,7 +557,10 @@ fn walk_refs_node(
             resolve_ref_qualified(node, tree, symbol_map, refs);
         }
         "field_expression" => {
-            resolve_ref_field(node, tree, scopes, symbol_map, var_types, field_type, refs);
+            resolve_ref_field(
+                node, tree, scopes, symbol_map, var_types, &global.field_type, locals,
+                &global.global_names, refs,
+            );
         }
         "initializer_list" => {
             // The aggregate's type comes from the enclosing declaration; a nested
@@ -531,7 +569,7 @@ fn walk_refs_node(
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 walk_refs_node(
-                    child, tree, scopes, symbol_map, var_types, typedefs, field_type,
+                    child, tree, scopes, symbol_map, var_types, typedefs, global, locals,
                     tag.as_deref(), refs,
                 );
             }
@@ -541,7 +579,7 @@ fn walk_refs_node(
             resolve_ref_init_pair(node, tree, init_tag, refs);
             if let Some(value) = node.child_by_field_name("value") {
                 walk_refs_node(
-                    value, tree, scopes, symbol_map, var_types, typedefs, field_type, None, refs,
+                    value, tree, scopes, symbol_map, var_types, typedefs, global, locals, None, refs,
                 );
             }
             return;
@@ -552,9 +590,31 @@ fn walk_refs_node(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         walk_refs_node(
-            child, tree, scopes, symbol_map, var_types, typedefs, field_type, init_tag, refs,
+            child, tree, scopes, symbol_map, var_types, typedefs, global, locals, init_tag, refs,
         );
     }
+}
+
+/// Collect the local variable and parameter names declared anywhere within a
+/// function body, used to drop references that can only denote a local.
+fn collect_function_locals(fn_node: tree_sitter::Node, tree: &SourceTree) -> HashSet<String> {
+    let mut set = HashSet::new();
+    fn walk(node: tree_sitter::Node, tree: &SourceTree, set: &mut HashSet<String>) {
+        if matches!(node.kind(), "declaration" | "parameter_declaration") {
+            let mut cursor = node.walk();
+            for d in node.children_by_field_name("declarator", &mut cursor) {
+                if let Some(name) = declarator_var_name(d, tree) {
+                    set.insert(name);
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            walk(child, tree, set);
+        }
+    }
+    walk(fn_node, tree, &mut set);
+    set
 }
 
 /// Resolve the struct tag of the aggregate an `initializer_list` initializes by
@@ -627,6 +687,8 @@ fn resolve_ref_id(
     tree: &SourceTree,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
+    locals: &HashSet<String>,
+    global_names: &HashSet<String>,
     refs: &mut Vec<Reference>,
 ) {
     let name = tree.node_text(&node);
@@ -635,6 +697,11 @@ fn resolve_ref_id(
         None => return,
     };
     if is_keyword(name) || is_type_ctx(parent.kind()) {
+        return;
+    }
+    // A pure local (bound in the enclosing function, no global of the same name)
+    // is not stored: it can't be queried project-wide and only bloats the DB.
+    if locals.contains(name) && !global_names.contains(name) {
         return;
     }
     let (ref_kind, context) = classify_ref(parent.kind());
@@ -663,6 +730,8 @@ fn resolve_ref_call(
     tree: &SourceTree,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
+    locals: &HashSet<String>,
+    global_names: &HashSet<String>,
     refs: &mut Vec<Reference>,
 ) {
     let function = match node.child_by_field_name("function") {
@@ -670,6 +739,9 @@ fn resolve_ref_call(
         None => return,
     };
     let name = tree.node_text(&function);
+    if locals.contains(name) && !global_names.contains(name) {
+        return;
+    }
     let symbol_id = lookup_id(name, scopes, symbol_map);
     let pos = function.start_position();
     let end_pos = function.end_position();
@@ -717,6 +789,7 @@ fn resolve_ref_qualified(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_ref_field(
     node: tree_sitter::Node,
     tree: &SourceTree,
@@ -724,6 +797,8 @@ fn resolve_ref_field(
     symbol_map: &HashMap<String, i64>,
     var_types: &HashMap<String, Option<String>>,
     field_type: &HashMap<(String, String), String>,
+    locals: &HashSet<String>,
+    global_names: &HashSet<String>,
     refs: &mut Vec<Reference>,
 ) {
     let field = match node.child_by_field_name("field") {
@@ -769,7 +844,7 @@ fn resolve_ref_field(
     });
     if let Some(operand) = node.child_by_field_name("argument") {
         if operand.kind() == "identifier" {
-            resolve_ref_id(operand, tree, scopes, symbol_map, refs);
+            resolve_ref_id(operand, tree, scopes, symbol_map, locals, global_names, refs);
         }
     }
 }
