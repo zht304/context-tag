@@ -250,26 +250,22 @@ impl DbStore {
 
     pub fn find_member_references(
         &self,
-        _struct_name: &str,
+        struct_name: &str,
         member_name: &str,
     ) -> anyhow::Result<Vec<(String, u32, u32, String)>> {
-        // Only match member accesses (`x.posted` / `p->posted`), not unrelated
-        // identifiers that happen to share the member's name.
-        let mut stmt = self.conn.prepare(
-            "SELECT f.path, r.line, r.col FROM refs r \
-             JOIN strings sn ON r.name_id = sn.id \
-             JOIN files f ON r.file_id = f.id \
-             WHERE sn.text = ? AND (r.flags & ?) != 0 ORDER BY f.path, r.line",
-        )?;
-        let mut rows = stmt.query(params![member_name, schema::F_REF_MEMBER])?;
-        let mut raw: Vec<(String, u32, u32)> = Vec::new();
-        while let Some(row) = rows.next()? {
-            raw.push((row.get(0)?, row.get(1)?, row.get(2)?));
+        // Prefer receiver-qualified matches (`Tag::member`) recorded when the
+        // indexer could infer the receiver's struct type; these exclude
+        // same-named members of unrelated structs. Fall back to bare member
+        // accesses when no qualified match exists (receiver type unresolved, or
+        // a DB indexed before qualification).
+        let qualified = format!("{}::{}", struct_name, member_name);
+        let mut rows = self.query_member_refs(&qualified)?;
+        if rows.is_empty() {
+            rows = self.query_member_refs(member_name)?;
         }
-        drop(rows);
         let mut cache = LineCache::new();
-        let mut out = Vec::with_capacity(raw.len());
-        for (path, line, col) in raw {
+        let mut out = Vec::with_capacity(rows.len());
+        for (path, line, col) in rows {
             let ctx = cache
                 .lines(&path)
                 .get(line as usize)
@@ -278,6 +274,21 @@ impl DbStore {
             out.push((path, line, col, ctx));
         }
         Ok(out)
+    }
+
+    fn query_member_refs(&self, name: &str) -> anyhow::Result<Vec<(String, u32, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, r.line, r.col FROM refs r \
+             JOIN strings sn ON r.name_id = sn.id \
+             JOIN files f ON r.file_id = f.id \
+             WHERE sn.text = ? AND (r.flags & ?) != 0 ORDER BY f.path, r.line",
+        )?;
+        let mut rows = stmt.query(params![name, schema::F_REF_MEMBER])?;
+        let mut raw = Vec::new();
+        while let Some(row) = rows.next()? {
+            raw.push((row.get(0)?, row.get(1)?, row.get(2)?));
+        }
+        Ok(raw)
     }
 
     // ---- Symbol listing ----

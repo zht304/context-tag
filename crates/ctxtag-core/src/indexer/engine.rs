@@ -305,7 +305,12 @@ pub(super) fn resolve_references_with_map(
 ) -> Vec<Reference> {
     let mut references: Vec<Reference> = Vec::new();
     let root = tree.root_node();
-    walk_refs_node(root, tree, scopes, symbol_map, &mut references);
+    // Build a per-file variable -> struct-tag map so member accesses can be
+    // qualified by their receiver's type (e.g. `timer->posted` where `timer`
+    // is `struct omap_dm_timer *` becomes `omap_dm_timer::posted`).
+    let typedefs = collect_typedefs(tree);
+    let var_types = collect_var_types(tree, &typedefs);
+    walk_refs_node(root, tree, scopes, symbol_map, &var_types, &mut references);
     references
 }
 
@@ -314,6 +319,7 @@ fn walk_refs_node(
     tree: &SourceTree,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
+    var_types: &HashMap<String, Option<String>>,
     refs: &mut Vec<Reference>,
 ) {
     match node.kind() {
@@ -323,20 +329,31 @@ fn walk_refs_node(
         }
         "call_expression" => {
             resolve_ref_call(node, tree, scopes, symbol_map, refs);
+            // resolve_ref_call records the callee; still recurse into the other
+            // children (arguments, or a `a->b()` field callee) so nested member
+            // accesses and identifiers are not dropped.
+            let func = node.child_by_field_name("function");
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if func.map(|f| f == child).unwrap_or(false) {
+                    continue;
+                }
+                walk_refs_node(child, tree, scopes, symbol_map, var_types, refs);
+            }
             return;
         }
         "qualified_identifier" => {
             resolve_ref_qualified(node, tree, symbol_map, refs);
         }
         "field_expression" => {
-            resolve_ref_field(node, tree, scopes, symbol_map, refs);
+            resolve_ref_field(node, tree, scopes, symbol_map, var_types, refs);
         }
         _ => {}
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_refs_node(child, tree, scopes, symbol_map, refs);
+        walk_refs_node(child, tree, scopes, symbol_map, var_types, refs);
     }
 }
 
@@ -440,6 +457,7 @@ fn resolve_ref_field(
     tree: &SourceTree,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
+    var_types: &HashMap<String, Option<String>>,
     refs: &mut Vec<Reference>,
 ) {
     let field = match node.child_by_field_name("field") {
@@ -451,10 +469,24 @@ fn resolve_ref_field(
     let pos = field.start_position();
     let end_pos = field.end_position();
     let is_ptr = tree.node_text(&node).contains("->");
+
+    // Qualify the member by the receiver's struct tag when it can be inferred
+    // within this file, so `Struct.member` queries don't match same-named
+    // members of unrelated structs. Falls back to the bare member name.
+    let recv_tag = node
+        .child_by_field_name("argument")
+        .and_then(|op| receiver_var_name(op, tree))
+        .and_then(|var| var_types.get(&var).cloned())
+        .flatten();
+    let symbol_name = match recv_tag {
+        Some(tag) => format!("{}::{}", tag, field_name),
+        None => field_name.to_string(),
+    };
+
     refs.push(Reference {
         id: None,
         symbol_id,
-        symbol_name: field_name.to_string(),
+        symbol_name,
         file_path: tree.file_path().to_string(),
         line: pos.row as u32,
         column: pos.column as u32,
@@ -470,11 +502,143 @@ fn resolve_ref_field(
         context_line: None,
         is_definition: false,
     });
-    if let Some(operand) = node.child_by_field_name("operand") {
+    if let Some(operand) = node.child_by_field_name("argument") {
         if operand.kind() == "identifier" {
             resolve_ref_id(operand, tree, scopes, symbol_map, refs);
         }
     }
+}
+
+/// Peel a declarator down to the declared variable's identifier name.
+/// Handles pointers, arrays, parentheses and initializers; returns `None` for
+/// function declarators (a function name is not a variable).
+fn declarator_var_name(node: tree_sitter::Node, tree: &SourceTree) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "type_identifier" => {
+            Some(tree.node_text(&node).to_string())
+        }
+        "pointer_declarator"
+        | "array_declarator"
+        | "parenthesized_declarator"
+        | "attributed_declarator"
+        | "init_declarator" => node
+            .child_by_field_name("declarator")
+            .and_then(|c| declarator_var_name(c, tree)),
+        _ => None,
+    }
+}
+
+/// Resolve a type-specifier node to a struct/union/class/enum tag name.
+/// Typedef aliases are resolved through the per-file typedef map. Returns
+/// `None` for primitive/sized types and unresolved aliases.
+fn base_type_tag(
+    node: tree_sitter::Node,
+    tree: &SourceTree,
+    typedefs: &HashMap<String, String>,
+) -> Option<String> {
+    match node.kind() {
+        "struct_specifier" | "union_specifier" | "class_specifier" | "enum_specifier" => node
+            .child_by_field_name("name")
+            .map(|n| tree.node_text(&n).to_string()),
+        "type_identifier" => typedefs.get(tree.node_text(&node)).cloned(),
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some(tag) = base_type_tag(child, tree, typedefs) {
+                    return Some(tag);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Extract the receiver variable name from a `field_expression` operand.
+/// Handles plain identifiers, `*p` and `(expr)` wrappers; returns `None` for
+/// chained accesses and calls whose type can't be inferred per-file.
+fn receiver_var_name(operand: tree_sitter::Node, tree: &SourceTree) -> Option<String> {
+    match operand.kind() {
+        "identifier" => Some(tree.node_text(&operand).to_string()),
+        "pointer_expression" => operand
+            .named_child(0)
+            .and_then(|c| receiver_var_name(c, tree)),
+        "parenthesized_expression" => operand
+            .named_child(0)
+            .and_then(|c| receiver_var_name(c, tree)),
+        _ => None,
+    }
+}
+
+/// Build a per-file typedef alias -> struct-tag map for `typedef struct X Y;`.
+fn collect_typedefs(tree: &SourceTree) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    fn walk(
+        node: tree_sitter::Node,
+        tree: &SourceTree,
+        map: &mut HashMap<String, String>,
+    ) {
+        if node.kind() == "type_definition" {
+            if let Some(ty) = node.child_by_field_name("type") {
+                if let Some(tag) = base_type_tag(ty, tree, map) {
+                    let mut cursor = node.walk();
+                    for d in node.children_by_field_name("declarator", &mut cursor) {
+                        if let Some(alias) = declarator_var_name(d, tree) {
+                            map.insert(alias, tag.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            walk(child, tree, map);
+        }
+    }
+    walk(tree.root_node(), tree, &mut map);
+    map
+}
+
+/// Build a per-file variable-name -> resolved-struct-tag map. A `None` value
+/// means the name is declared with a non-struct type or with conflicting types
+/// in the same file, so member accesses on it must not be qualified.
+fn collect_var_types(
+    tree: &SourceTree,
+    typedefs: &HashMap<String, String>,
+) -> HashMap<String, Option<String>> {
+    let mut map: HashMap<String, Option<String>> = HashMap::new();
+    fn walk(
+        node: tree_sitter::Node,
+        tree: &SourceTree,
+        typedefs: &HashMap<String, String>,
+        map: &mut HashMap<String, Option<String>>,
+    ) {
+        match node.kind() {
+            "declaration" | "parameter_declaration" | "field_declaration" => {
+                if let Some(ty) = node.child_by_field_name("type") {
+                    let tag = base_type_tag(ty, tree, typedefs);
+                    let mut cursor = node.walk();
+                    for d in node.children_by_field_name("declarator", &mut cursor) {
+                        if let Some(name) = declarator_var_name(d, tree) {
+                            map.entry(name)
+                                .and_modify(|existing| {
+                                    if *existing != tag {
+                                        *existing = None;
+                                    }
+                                })
+                                .or_insert_with(|| tag.clone());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            walk(child, tree, typedefs, map);
+        }
+    }
+    walk(tree.root_node(), tree, typedefs, &mut map);
+    map
 }
 
 pub(super) fn lookup_id(
