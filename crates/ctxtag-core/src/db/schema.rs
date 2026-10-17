@@ -133,6 +133,7 @@ pub const F_SYMBOL_CONST: i64 = 1 << 4;
 
 // ─── refs.flags / includes.flags / macros.flags ────────────────────────
 pub const F_REF_IS_DEF: i64 = 1 << 0;
+pub const F_REF_MEMBER: i64 = 1 << 1;
 pub const F_INCLUDE_SYSTEM: i64 = 1 << 0;
 pub const F_MACRO_FN_LIKE: i64 = 1 << 0;
 

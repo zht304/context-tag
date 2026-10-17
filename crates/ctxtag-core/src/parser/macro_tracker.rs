@@ -41,10 +41,8 @@ impl MacroTracker {
                 self.extract_define(node, tree);
             }
 
-            // #undef directive
-            "preproc_func_def" => {
-                // This is actually a function-like macro definition (#define FOO(x) ...)
-                // in some tree-sitter versions. Handle it like preproc_def.
+            // Function-like macro definition: #define FOO(x) ...
+            "preproc_function_def" => {
                 self.extract_define(node, tree);
             }
 

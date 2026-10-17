@@ -293,6 +293,14 @@ impl SymbolExtractor {
             return;
         }
 
+        // A bodyless elaborated type used inside another declaration
+        // (`struct dmtimer *timer`, field types, parameters, ...) is a type
+        // *usage*, not a declaration. Only genuine forward declarations
+        // (`struct dmtimer;`) and definitions (with a body) become symbols.
+        if body.is_none() && is_elaborated_type_usage(&node) {
+            return;
+        }
+
         // Determine if struct or union
         let kind = if is_union_context(&node) {
             (SymbolKind::Union, ScopeKind::Union)
@@ -354,48 +362,69 @@ impl SymbolExtractor {
         container: String,
         tree: &SourceTree,
     ) {
-        // field_declaration -> declarators + type
+        // field_declaration -> type + one or more `declarator` fields
+        // (each a _field_declarator: field_identifier, pointer_declarator,
+        //  array_declarator, function_declarator, ...). Bit-fields such as
+        //  `unsigned posted:1;` carry a separate `bitfield_clause` child.
         let type_node = node.child_by_field_name("type");
-        let decl_type_str = type_node.map(|n| tree.node_text(&n).to_string()).unwrap_or_default();
+        let base_type = type_node
+            .map(|n| tree.node_text(&n).to_string())
+            .unwrap_or_default();
 
-        // Check for bit field
-        let declarators = node.child_by_field_name("declarators");
-        if let Some(decls) = declarators {
-            let mut cursor = decls.walk();
-            for child in decls.named_children(&mut cursor) {
-                if child.kind() == "field_declarator" {
-                    let name_node = child.child_by_field_name("declarator");
-                    if let Some(decl) = name_node {
-                        let member_name = self.extract_declarator_name(&decl, tree);
-                        if member_name.is_empty() {
-                            continue;
-                        }
+        let decl_text_full = tree.node_text(&node);
+        let access = self.infer_access_modifier(node);
 
-                        let pos = child.start_position();
-                        let end_pos = child.end_position();
-                        let qualified = format!("{}::{}", container, member_name);
+        let mut cursor = node.walk();
+        for decl in node.children_by_field_name("declarator", &mut cursor) {
+            let member_name = self.extract_declarator_name(&decl, tree);
+            if member_name.is_empty() {
+                continue;
+            }
 
-                        let mut symbol = Symbol::new(&qualified, SymbolKind::Member);
-                        symbol.name = member_name;
-                        symbol.qualified_name = qualified;
-                        symbol.is_definition = true;
-                        symbol.file_path = self.file_path.clone();
-                        symbol.line_start = pos.row as u32;
-                        symbol.line_end = end_pos.row as u32;
-                        symbol.column_start = pos.column as u32;
-                        symbol.column_end = end_pos.column as u32;
-                        symbol.declared_type = Some(decl_type_str.clone());
-                        symbol.scope_kind = ScopeKind::Struct;
-                        symbol.scope_depth = self.container_stack.len() as u32 + 1;
-                        symbol.container_name = Some(container.clone());
-                        symbol.access_modifier = self.infer_access_modifier(child);
-                        symbol.selection_line = Some(pos.row as u32);
-                        symbol.selection_column = Some(pos.column as u32);
-
-                        self.symbols.push(symbol);
+            // Reconstruct a decorated type string (pointer / array markers).
+            let decl_text = tree.node_text(&decl);
+            let mut declared_type = base_type.clone();
+            let stars = decl_text.chars().filter(|&c| c == '*').count();
+            for _ in 0..stars {
+                declared_type.push_str(" *");
+            }
+            if decl_text.contains('[') {
+                declared_type.push_str("[]");
+            }
+            if decl_text_full.contains(':') && !declared_type.is_empty() {
+                // bit-field: keep the width in the displayed type
+                if let Some(colon) = decl_text_full.rfind(':') {
+                    let width = decl_text_full[colon + 1..]
+                        .trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+                    if !width.is_empty() && width.chars().all(|c| c.is_ascii_digit()) {
+                        declared_type.push_str(" :");
+                        declared_type.push_str(width);
                     }
                 }
             }
+
+            let pos = decl.start_position();
+            let end_pos = decl.end_position();
+            let qualified = format!("{}::{}", container, member_name);
+
+            let mut symbol = Symbol::new(&qualified, SymbolKind::Member);
+            symbol.name = member_name;
+            symbol.qualified_name = qualified;
+            symbol.is_definition = true;
+            symbol.file_path = self.file_path.clone();
+            symbol.line_start = pos.row as u32;
+            symbol.line_end = end_pos.row as u32;
+            symbol.column_start = pos.column as u32;
+            symbol.column_end = end_pos.column as u32;
+            symbol.declared_type = Some(declared_type);
+            symbol.scope_kind = ScopeKind::Struct;
+            symbol.scope_depth = self.container_stack.len() as u32;
+            symbol.container_name = Some(container.clone());
+            symbol.access_modifier = access.clone();
+            symbol.selection_line = Some(pos.row as u32);
+            symbol.selection_column = Some(pos.column as u32);
+
+            self.symbols.push(symbol);
         }
     }
 
@@ -406,6 +435,9 @@ impl SymbolExtractor {
         let name = name_node.map(|n| tree.node_text(&n).to_string()).unwrap_or_default();
 
         let body = node.child_by_field_name("body");
+        if body.is_none() && is_elaborated_type_usage(&node) {
+            return;
+        }
         let display_name = if name.is_empty() {
             get_anonymous_type_name(&node, tree)
         } else {
@@ -495,6 +527,10 @@ impl SymbolExtractor {
         let body = node.child_by_field_name("body");
 
         if name.is_empty() && body.is_none() {
+            return;
+        }
+
+        if body.is_none() && is_elaborated_type_usage(&node) {
             return;
         }
 
@@ -854,7 +890,9 @@ impl SymbolExtractor {
 
     fn extract_declarator_name(&self, node: &Node, tree: &SourceTree) -> String {
         match node.kind() {
-            "identifier" => tree.node_text(node).to_string(),
+            "identifier" | "field_identifier" | "type_identifier" => {
+                tree.node_text(node).to_string()
+            }
             "function_declarator" => {
                 node.child_by_field_name("declarator")
                     .map(|d| self.extract_declarator_name(&d, tree))
@@ -863,6 +901,8 @@ impl SymbolExtractor {
             "ptr_declarator"
             | "array_declarator"
             | "parameter_list"
+            | "parenthesized_declarator"
+            | "attributed_declarator"
             | "pointer_declarator" => {
                 node.child_by_field_name("declarator")
                     .map(|d| self.extract_declarator_name(&d, tree))
@@ -1107,6 +1147,26 @@ fn is_union_context(node: &Node) -> bool {
         }
     }
     false
+}
+
+/// A struct/union/enum/class specifier without a body appears both as a genuine
+/// forward declaration (`struct dmtimer;`) and as an elaborated type *usage*
+/// embedded in another declaration (`struct dmtimer *timer`, parameters, field
+/// types, casts, sizeof, ...). Only the standalone forward declaration should
+/// become a symbol; usages are references, not declarations.
+fn is_elaborated_type_usage(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    match parent.kind() {
+        // `struct foo x;` has a declarator (usage); `struct foo;` does not
+        // (genuine forward declaration).
+        "declaration" => parent.child_by_field_name("declarator").is_some(),
+        // Anywhere else — parameter_declaration, field_declaration,
+        // type_definition, function return type, cast, sizeof — it is a usage.
+        _ => true,
+    }
 }
 
 fn get_anonymous_type_name(node: &Node, tree: &SourceTree) -> String {

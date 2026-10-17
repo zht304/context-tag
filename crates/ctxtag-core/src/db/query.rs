@@ -111,10 +111,81 @@ impl DbStore {
 
     pub fn find_definitions(&self, name: &str) -> anyhow::Result<Vec<QueryResult>> {
         let sql = format!(
-            "SELECT {} {} WHERE sn.text = ? ORDER BY (s.flags & 1) DESC, f.path",
+            "SELECT {} {} WHERE sn.text = ? ORDER BY (s.flags & 1) DESC, f.path, s.line_start",
             SYM_COLS, SYM_JOINS
         );
-        self.query_symbols(&sql, params![name])
+        let mut results = self.query_symbols(&sql, params![name])?;
+
+        // Prefer real definitions over declarations: when a definition exists,
+        // drop forward declarations so go-to-definition isn't polluted by them.
+        if results.iter().any(|r| r.symbol.is_definition) {
+            results.retain(|r| r.symbol.is_definition);
+        }
+
+        // Macros live in their own table; `#define kmalloc(...)` must also be
+        // reachable from go-to-definition.
+        let mut macros = self.find_macro(name)?;
+        results.append(&mut macros);
+        Ok(results)
+    }
+
+    /// Look up preprocessor macro definitions by name.
+    pub fn find_macro(&self, name: &str) -> anyhow::Result<Vec<QueryResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, sn.text, m.flags, sp.text, sb.text, f.path, m.line \
+             FROM macros m \
+             JOIN strings sn ON m.name_id = sn.id \
+             LEFT JOIN strings sp ON m.params_id = sp.id \
+             LEFT JOIN strings sb ON m.body_id = sb.id \
+             JOIN files f ON m.file_id = f.id \
+             WHERE sn.text = ? ORDER BY f.path, m.line",
+        )?;
+        let mut rows = stmt.query(params![name])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let mname: String = row.get(1)?;
+            let flags: i64 = row.get(2)?;
+            let params_json: Option<String> = row.get(3)?;
+            let body: Option<String> = row.get(4)?;
+            let file_path: String = row.get(5)?;
+            let line: i64 = row.get(6)?;
+
+            let params: Vec<String> = params_json
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let is_fn = flags & schema::F_MACRO_FN_LIKE != 0;
+
+            let mut sig = String::from("#define ");
+            sig.push_str(&mname);
+            if is_fn {
+                sig.push('(');
+                sig.push_str(&params.join(", "));
+                sig.push(')');
+            }
+            if let Some(b) = body.as_deref().map(str::trim) {
+                if !b.is_empty() {
+                    sig.push(' ');
+                    sig.push_str(b);
+                }
+            }
+
+            let mut sym = Symbol::new(&mname, SymbolKind::Macro);
+            sym.id = Some(id);
+            sym.is_definition = true;
+            sym.file_path = file_path.clone();
+            sym.line_start = line as u32;
+            sym.line_end = line as u32;
+            sym.column_start = 0;
+            sym.column_end = 0;
+            sym.selection_line = Some(line as u32);
+            sym.selection_column = Some(0);
+            sym.signature = Some(sig);
+            sym.declared_type = if is_fn { Some("function-like macro".into()) } else { Some("macro".into()) };
+
+            out.push(QueryResult { symbol: sym, file_path });
+        }
+        Ok(out)
     }
 
     pub fn find_definition_at(
@@ -182,13 +253,15 @@ impl DbStore {
         _struct_name: &str,
         member_name: &str,
     ) -> anyhow::Result<Vec<(String, u32, u32, String)>> {
+        // Only match member accesses (`x.posted` / `p->posted`), not unrelated
+        // identifiers that happen to share the member's name.
         let mut stmt = self.conn.prepare(
             "SELECT f.path, r.line, r.col FROM refs r \
              JOIN strings sn ON r.name_id = sn.id \
              JOIN files f ON r.file_id = f.id \
-             WHERE sn.text = ? ORDER BY f.path, r.line",
+             WHERE sn.text = ? AND (r.flags & ?) != 0 ORDER BY f.path, r.line",
         )?;
-        let mut rows = stmt.query(params![member_name])?;
+        let mut rows = stmt.query(params![member_name, schema::F_REF_MEMBER])?;
         let mut raw: Vec<(String, u32, u32)> = Vec::new();
         while let Some(row) = rows.next()? {
             raw.push((row.get(0)?, row.get(1)?, row.get(2)?));

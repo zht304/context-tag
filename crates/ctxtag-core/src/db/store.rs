@@ -337,7 +337,10 @@ impl DbStore {
                 let file_id = *file_map.get(&r.file_path).unwrap_or(&0);
                 let name_id = intern(&tx, str_cache, &r.symbol_name)?;
                 let kind = schema::refkind_to_int(r.ref_kind.as_str());
-                let flags = if r.is_definition { schema::F_REF_IS_DEF } else { 0 };
+                let mut flags = if r.is_definition { schema::F_REF_IS_DEF } else { 0 };
+                if r.context.as_deref() == Some("member_access") {
+                    flags |= schema::F_REF_MEMBER;
+                }
                 ins.execute(params![
                     name_id,
                     file_id,
