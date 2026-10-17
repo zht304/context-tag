@@ -89,9 +89,9 @@ const INS_SYMBOL: &str = "INSERT INTO symbols (
     scope_kind, scope_depth, parent_id, container_id
 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
-const INS_REF: &str = "INSERT INTO refs (
-    name_id, file_id, line, col, end_line, end_col, kind, flags
-) VALUES (?,?,?,?,?,?,?,?)";
+const INS_REF: &str = "INSERT OR IGNORE INTO refs (
+    name_id, file_id, line, col, kind, flags
+) VALUES (?,?,?,?,?,?)";
 
 const INS_CALL: &str =
     "INSERT INTO call_edges (caller_id, callee_id, file_id, line, col) VALUES (?,?,?,?,?)";
@@ -107,6 +107,9 @@ const INS_FTS: &str = "INSERT INTO symbols_fts(rowid, name) VALUES (?,?)";
 impl DbStore {
     pub fn new(db_path: &str) -> anyhow::Result<Self> {
         let conn = rusqlite::Connection::open(db_path)?;
+        // Larger pages shallow the B-tree for the big tables (refs/symbols),
+        // cutting seeks per lookup. Only takes effect on a fresh DB file.
+        conn.pragma_update(None, "page_size", 8192)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "OFF")?;
@@ -121,6 +124,9 @@ impl DbStore {
     /// `finalize_indexes()`.
     pub fn new_bulk_mode(db_path: &str) -> anyhow::Result<Self> {
         let conn = rusqlite::Connection::open(db_path)?;
+        // Larger pages shallow the B-tree for the big tables (refs/symbols),
+        // cutting seeks per lookup. Only takes effect on a fresh DB file.
+        conn.pragma_update(None, "page_size", 8192)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "OFF")?;
         conn.pragma_update(None, "foreign_keys", "OFF")?;
@@ -346,8 +352,6 @@ impl DbStore {
                     file_id,
                     r.line as i64,
                     r.column as i64,
-                    r.end_line.map(|v| v as i64),
-                    r.end_column.map(|v| v as i64),
                     kind,
                     flags,
                 ])?;

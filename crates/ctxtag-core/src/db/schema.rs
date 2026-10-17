@@ -42,17 +42,19 @@ pub const TABLES: &[&str] = &[
         parent_id INTEGER,
         container_id INTEGER
     );"#,
+    // WITHOUT ROWID: the table is a single B-tree clustered by the primary key
+    // (name_id first), so "all references to symbol X" is one contiguous range
+    // scan and no separate name index is needed. end_line/end_col are dropped —
+    // they are derivable from col + the interned name length.
     r#"CREATE TABLE IF NOT EXISTS refs (
-        id INTEGER PRIMARY KEY,
         name_id INTEGER NOT NULL,
         file_id INTEGER NOT NULL,
         line INTEGER NOT NULL,
         col INTEGER NOT NULL,
-        end_line INTEGER,
-        end_col INTEGER,
         kind INTEGER NOT NULL DEFAULT 0,
-        flags INTEGER NOT NULL DEFAULT 0
-    );"#,
+        flags INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (name_id, file_id, line, col)
+    ) WITHOUT ROWID;"#,
     r#"CREATE TABLE IF NOT EXISTS call_edges (
         id INTEGER PRIMARY KEY,
         caller_id INTEGER NOT NULL,
@@ -100,7 +102,6 @@ pub const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);",
     "CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id, line_start);",
     "CREATE INDEX IF NOT EXISTS idx_symbols_container ON symbols(container_id);",
-    "CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name_id);",
     "CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id);",
     "CREATE INDEX IF NOT EXISTS idx_call_caller ON call_edges(caller_id);",
     "CREATE INDEX IF NOT EXISTS idx_call_callee ON call_edges(callee_id);",
@@ -115,7 +116,6 @@ pub const INDEX_NAMES: &[&str] = &[
     "idx_symbols_kind",
     "idx_symbols_file",
     "idx_symbols_container",
-    "idx_refs_name",
     "idx_refs_file",
     "idx_call_caller",
     "idx_call_callee",
