@@ -35,46 +35,79 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
+const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const vscode_1 = require("vscode");
 const node_1 = require("vscode-languageclient/node");
 let client;
+/**
+ * Locate the ctx-lsp binary.
+ * Priority: ctxtag.serverPath setting → repo target/release → repo target/debug → PATH.
+ */
+function resolveServerPath(extensionRoot) {
+    const configured = vscode_1.workspace
+        .getConfiguration("ctxtag")
+        .get("serverPath", "")
+        .trim();
+    if (configured) {
+        return fs.existsSync(configured) ? configured : undefined;
+    }
+    // The extension lives at <repo>/plugin/vscode, so the repo root is two levels up.
+    const projectRoot = path.resolve(extensionRoot, "../..");
+    const candidates = [
+        path.join(projectRoot, "target", "release", "ctx-lsp"),
+        path.join(projectRoot, "target", "debug", "ctx-lsp"),
+    ];
+    for (const c of candidates) {
+        if (fs.existsSync(c)) {
+            return c;
+        }
+    }
+    // Fall back to whatever is on PATH.
+    return "ctx-lsp";
+}
 function activate(context) {
-    // Resolve the path to the ctx-lsp binary.
-    // The extension lives under plugin/vscode/, so the project root is two levels up.
-    const extensionRoot = context.extensionPath; // .../plugin/vscode/
-    const projectRoot = path.resolve(extensionRoot, "../../.."); // .../context-tag/
-    const releasePath = path.join(projectRoot, "target", "release", "ctx-lsp");
-    const debugPath = path.join(projectRoot, "target", "debug", "ctx-lsp");
-    // Prefer the release binary, fall back to debug.
-    let serverCommand;
-    try {
-        require("fs").accessSync(releasePath);
-        serverCommand = releasePath;
+    const serverCommand = resolveServerPath(context.extensionPath);
+    if (!serverCommand) {
+        vscode_1.window.showErrorMessage("Context Tag: ctx-lsp binary not found. Build it with `cargo build --release`, " +
+            "or set ctxtag.serverPath to its absolute path.");
+        return;
     }
-    catch {
-        serverCommand = debugPath;
-    }
-    const serverModule = serverCommand;
     const serverOptions = {
-        run: { command: serverModule, transport: node_1.TransportKind.stdio },
-        debug: { command: serverModule, transport: node_1.TransportKind.stdio },
+        run: { command: serverCommand, transport: node_1.TransportKind.stdio },
+        debug: { command: serverCommand, transport: node_1.TransportKind.stdio },
     };
+    // Optional: force the workspace root used to find {root}/.ctxtag.db.
+    const rootOverride = vscode_1.workspace
+        .getConfiguration("ctxtag")
+        .get("rootUri", "")
+        .trim();
     const clientOptions = {
         documentSelector: [
             { scheme: "file", language: "c" },
             { scheme: "file", language: "cpp" },
         ],
         synchronize: {
-            // Synchronize setting changes to the server
             configurationSection: ["ctxtag"],
         },
-        initializationOptions: {
-            rootPath: vscode_1.workspace.workspaceFolders?.[0]?.uri.fsPath,
-        },
+        traceOutputChannel: vscode_1.workspace.getConfiguration("ctxtag").get("trace.server", "off") !==
+            "off"
+            ? vscode_1.window.createOutputChannel("Context Tag LSP Trace")
+            : undefined,
     };
+    if (rootOverride) {
+        const fsPath = vscode_1.Uri.parse(rootOverride).fsPath || rootOverride;
+        const folder = {
+            uri: vscode_1.Uri.file(fsPath),
+            name: path.basename(fsPath),
+            index: 0,
+        };
+        clientOptions.workspaceFolder = folder;
+    }
     client = new node_1.LanguageClient("ctxLsp", "Context Tag Language Server", serverOptions, clientOptions);
-    client.start();
+    client.start().catch((err) => {
+        vscode_1.window.showErrorMessage(`Context Tag: failed to start ctx-lsp (${serverCommand}): ${err}`);
+    });
 }
 function deactivate() {
     if (!client) {

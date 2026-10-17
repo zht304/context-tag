@@ -3,13 +3,20 @@ mod utils;
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
     DocumentSymbol, GotoDefinitionResponse, Hover, HoverContents,
-    InitializeParams, InitializeResult, Location, MarkupContent, MarkupKind, Position, Range,
+    InitializeParams, Location, MarkupContent, MarkupKind, Position, Range,
     ServerCapabilities, SymbolInformation, TextDocumentSyncKind, TextDocumentSyncOptions, Url,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use crossbeam_channel::Sender;
 use ctxtag_core::DbStore;
+
+/// Single shared channel to the LSP IO thread. Set once in `main`; used by
+/// `send_response` so every handler writes over the same connection instead of
+/// spawning a fresh `Connection::stdio()` (which would create competing IO
+/// threads on stdin/stdout).
+static SENDER: OnceLock<Sender<Message>> = OnceLock::new();
 
 struct BackendState {
     store: Option<Arc<DbStore>>,
@@ -26,9 +33,14 @@ impl BackendState {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Logs MUST go to stderr: stdout is the LSP JSON-RPC channel and any stray
+    // bytes there corrupt the Content-Length framing.
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
 
-    let (connection, _io_threads) = Connection::stdio();
+    let (connection, io_threads) = Connection::stdio();
+
+    // Share the single connection's sender with all handlers.
+    SENDER.set(connection.sender.clone()).ok();
 
     let server_capabilities = ServerCapabilities {
         definition_provider: Some(lsp_types::OneOf::Left(true)),
@@ -50,20 +62,31 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let init_result = Response {
-        id: RequestId::from(1i32),
-        error: None,
-        result: Some(serde_json::to_value(InitializeResult {
-            capabilities: server_capabilities,
-            server_info: Some(lsp_types::ServerInfo {
-                name: "ctxtag-lsp".to_string(),
-                version: Some("0.1.0".to_string()),
-            }),
-        })?),
-    };
-    connection.sender.send(Message::Response(init_result))?;
+    let init_result = serde_json::to_value(server_capabilities)?;
+
+    // Standard LSP handshake: reads the client's `initialize` request, replies
+    // with the matching id, waits for `initialized`, and returns the client's
+    // initialize params. `initialize` wraps the value as `{ "capabilities": .. }`.
+    let init_params = connection.initialize(init_result)?;
 
     let state = Arc::new(Mutex::new(BackendState::new()));
+
+    // Load the database from the workspace root: {root}/.ctxtag.db
+    if let Ok(params) = serde_json::from_value::<InitializeParams>(init_params) {
+        if let Some(root_uri) = params.root_uri {
+            if let Ok(root_path) = root_uri.to_file_path() {
+                let root_path_str = root_path.to_string_lossy().to_string();
+                let db_path = format!("{}/.ctxtag.db", root_path_str);
+                match DbStore::new(&db_path) {
+                    Ok(store) => {
+                        tracing::info!("Loaded database: {}", db_path);
+                        state.lock().unwrap().store = Some(Arc::new(store));
+                    }
+                    Err(e) => tracing::error!("Failed to open database {}: {}", db_path, e),
+                }
+            }
+        }
+    }
 
     loop {
         let msg = match connection.receiver.recv() {
@@ -72,28 +95,15 @@ fn main() -> anyhow::Result<()> {
         };
         match msg {
             Message::Request(req) => {
-                if connection.handle_shutdown(&req).is_ok() {
-                    return Ok(());
+                // handle_shutdown returns Ok(true) only for a real `shutdown`
+                // request; Ok(false) for everything else (keep looping).
+                if connection.handle_shutdown(&req)? {
+                    break;
                 }
                 let method = req.method.clone();
                 let id = req.id.clone();
 
                 match method.as_str() {
-                    "initialize" => {
-                        if let Ok(params) = serde_json::from_value::<InitializeParams>(req.params.clone()) {
-                            if let Some(root_uri) = params.root_uri {
-                                if let Ok(root_path) = root_uri.to_file_path() {
-                                    let root_path_str = root_path.to_string_lossy().to_string();
-                                    let db_path = format!("{}/.ctxtag.db", root_path_str);
-
-                                    if let Ok(store) = DbStore::new(&db_path) {
-                                        let mut state = state.lock().unwrap();
-                                        state.store = Some(Arc::new(store));
-                                    }
-                                }
-                            }
-                        }
-                    }
                     "textDocument/definition" => handle_definition(&state, id, Some(req.params.clone()))?,
                     "textDocument/references" => handle_references(&state, id, Some(req.params.clone()))?,
                     "textDocument/documentSymbol" => {
@@ -127,6 +137,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    io_threads.join()?;
     Ok(())
 }
 
@@ -134,17 +145,20 @@ fn send_response(
     id: RequestId,
     result: Result<serde_json::Value, String>,
 ) -> anyhow::Result<()> {
-    let (connection, _) = Connection::stdio();
+    let sender = match SENDER.get() {
+        Some(s) => s,
+        None => return Ok(()),
+    };
     match result {
         Ok(val) => {
-            let _ = connection.sender.send(Message::Response(Response {
+            let _ = sender.send(Message::Response(Response {
                 id,
                 error: None,
                 result: Some(val),
             }));
         }
         Err(msg) => {
-            let _ = connection.sender.send(Message::Response(Response {
+            let _ = sender.send(Message::Response(Response {
                 id,
                 error: Some(lsp_server::ResponseError {
                     code: -32603,

@@ -2,7 +2,8 @@
   "name": "ctxtag",
   "displayName": "Context Tag",
   "description": "C/C++ symbol analysis and navigation",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "publisher": "ctxtag",
   "engines": {
     "vscode": "^1.74.0"
   },
@@ -15,6 +16,27 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "Context Tag",
+      "properties": {
+        "ctxtag.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the ctx-lsp binary. Leave empty to auto-detect (repo target/release, target/debug, then PATH)."
+        },
+        "ctxtag.rootUri": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace root used to locate the database at {rootUri}/.ctxtag.db. Leave empty to use the opened workspace folder."
+        },
+        "ctxtag.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the ctx-lsp server (Output panel → 'Context Tag Language Server')."
+        }
+      }
+    },
     "languages": [
       {
         "id": "c",
@@ -43,11 +65,13 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./"
   },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
   "devDependencies": {
     "@types/node": "^22.20.2",
     "@types/vscode": "^1.74.0",
-    "typescript": "^5.0.0",
-    "vscode-languageclient": "^9.0.1"
+    "typescript": "^5.0.0"
   },
   "license": "MIT"
 }

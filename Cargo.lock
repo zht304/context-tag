@@ -256,6 +256,7 @@ name = "ctxtag-lsp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam-channel",
  "ctxtag-core",
  "lsp-server",
  "lsp-types",
