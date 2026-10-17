@@ -291,6 +291,61 @@ impl DbStore {
         Ok(raw)
     }
 
+    /// Find the receiver-qualified member reference covering a cursor position.
+    ///
+    /// Returns `(struct_tag, member)` when the token at `line`/`col` is a member
+    /// access the indexer resolved to a concrete struct (stored as
+    /// `Tag::member`). Editors use this to scope go-to-definition/references to
+    /// the right struct instead of matching every same-named member.
+    pub fn member_ref_at(
+        &self,
+        file_path: &str,
+        line: u32,
+        col: u32,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sn.text, r.col FROM refs r \
+             JOIN strings sn ON r.name_id = sn.id \
+             JOIN files f ON r.file_id = f.id \
+             WHERE f.path = ? AND r.line = ? AND (r.flags & ?) != 0 \
+               AND instr(sn.text, '::') > 0 AND r.col <= ? \
+             ORDER BY r.col DESC",
+        )?;
+        let mut rows = stmt.query(params![file_path, line, schema::F_REF_MEMBER, col])?;
+        while let Some(row) = rows.next()? {
+            let text: String = row.get(0)?;
+            let start: u32 = row.get(1)?;
+            if let Some(sep) = text.find("::") {
+                let tag = &text[..sep];
+                let member = &text[sep + 2..];
+                // The stored col is the member token's start; accept the cursor
+                // anywhere within that token.
+                if col < start + member.len() as u32 {
+                    return Ok(Some((tag.to_string(), member.to_string())));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Find the definition of a specific struct/union/class member.
+    pub fn find_member_definition(
+        &self,
+        struct_name: &str,
+        member_name: &str,
+    ) -> anyhow::Result<Vec<QueryResult>> {
+        let sql = format!(
+            "SELECT {} {} WHERE sn.text = ? AND sc.text = ? \
+             ORDER BY (s.flags & 1) DESC, f.path, s.line_start",
+            SYM_COLS, SYM_JOINS
+        );
+        let mut results = self.query_symbols(&sql, params![member_name, struct_name])?;
+        if results.iter().any(|r| r.symbol.is_definition) {
+            results.retain(|r| r.symbol.is_definition);
+        }
+        Ok(results)
+    }
+
     // ---- Symbol listing ----
 
     pub fn list_symbols(

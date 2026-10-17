@@ -224,7 +224,7 @@ fn handle_definition(
         serde_json::from_value(params.unwrap_or_default())?;
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
-    let _file_path = uri.to_file_path().unwrap_or_default().to_string_lossy().to_string();
+    let file_path = uri.to_file_path().unwrap_or_default().to_string_lossy().to_string();
     let word = utils::word_at_position(&uri, pos);
 
     let word = match word {
@@ -232,24 +232,24 @@ fn handle_definition(
         None => return send_response(id, Err("No word at position".into())),
     };
 
+    // Member access (`p->field` / `x.field`): when the indexer resolved the
+    // receiver's struct, scope the jump to that struct's member instead of
+    // matching every same-named symbol.
+    if let Ok(Some((tag, member))) = store.member_ref_at(&file_path, pos.line, pos.character) {
+        let mut results = store.find_member_definition(&tag, &member).unwrap_or_default();
+        if results.is_empty() {
+            results = store.find_definitions(&member).unwrap_or_default();
+        }
+        let locations = symbol_locations(&results);
+        return send_response(
+            id,
+            Ok(serde_json::to_value(GotoDefinitionResponse::Array(locations))?),
+        );
+    }
+
     let results = store.find_definitions(&word).ok();
     if let Some(results) = results {
-        let locations: Vec<Location> = results
-            .iter()
-            .map(|r| Location {
-                uri: url_from_path(&r.file_path),
-                range: Range {
-                    start: Position {
-                        line: r.symbol.line_start,
-                        character: r.symbol.column_start,
-                    },
-                    end: Position {
-                        line: r.symbol.line_end,
-                        character: r.symbol.column_end,
-                    },
-                },
-            })
-            .collect();
+        let locations = symbol_locations(&results);
         return send_response(
             id,
             Ok(serde_json::to_value(GotoDefinitionResponse::Array(locations))?),
@@ -257,6 +257,26 @@ fn handle_definition(
     }
 
     send_response(id, Ok(serde_json::json!(null)))
+}
+
+/// Map query results to LSP locations.
+fn symbol_locations(results: &[ctxtag_core::QueryResult]) -> Vec<Location> {
+    results
+        .iter()
+        .map(|r| Location {
+            uri: url_from_path(&r.file_path),
+            range: Range {
+                start: Position {
+                    line: r.symbol.line_start,
+                    character: r.symbol.column_start,
+                },
+                end: Position {
+                    line: r.symbol.line_end,
+                    character: r.symbol.column_end,
+                },
+            },
+        })
+        .collect()
 }
 
 fn handle_references(
@@ -273,34 +293,45 @@ fn handle_references(
         serde_json::from_value(params.unwrap_or_default())?;
     let uri = params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
+    let file_path = uri.to_file_path().unwrap_or_default().to_string_lossy().to_string();
     let word = utils::word_at_position(&uri, pos);
     let word = match word {
         Some(w) => w,
         None => return send_response(id, Err("No word".into())),
     };
 
+    // Member access: scope references to the receiver's struct when resolved,
+    // otherwise every same-named member across all structs would match.
+    if let Ok(Some((tag, member))) = store.member_ref_at(&file_path, pos.line, pos.character) {
+        if let Ok(mrefs) = store.find_member_references(&tag, &member) {
+            let locations: Vec<Location> = mrefs
+                .iter()
+                .map(|(file, line, col, _)| ref_location(file, *line, *col))
+                .collect();
+            return send_response(id, Ok(serde_json::to_value(locations)?));
+        }
+    }
+
     let refs = store.find_references(&word).ok();
     if let Some(refs) = refs {
         let locations: Vec<Location> = refs
             .iter()
-            .map(|(_, file, line, col, _, _)| Location {
-                uri: url_from_path(file),
-                range: Range {
-                    start: Position {
-                        line: *line,
-                        character: *col,
-                    },
-                    end: Position {
-                        line: *line,
-                        character: col + 1,
-                    },
-                },
-            })
+            .map(|(_, file, line, col, _, _)| ref_location(file, *line, *col))
             .collect();
         return send_response(id, Ok(serde_json::to_value(locations)?));
     }
 
     send_response(id, Ok(serde_json::json!([])))
+}
+
+fn ref_location(file: &str, line: u32, col: u32) -> Location {
+    Location {
+        uri: url_from_path(file),
+        range: Range {
+            start: Position { line, character: col },
+            end: Position { line, character: col + 1 },
+        },
+    }
 }
 
 fn handle_document_symbol(
@@ -424,13 +455,25 @@ fn handle_hover(
         serde_json::from_value(params.unwrap_or_default())?;
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
+    let file_path = uri.to_file_path().unwrap_or_default().to_string_lossy().to_string();
     let word = utils::word_at_position(&uri, pos);
     let word = match word {
         Some(w) => w,
         None => return send_response(id, Ok(serde_json::json!(null))),
     };
 
-    let results = store.find_definitions(&word).ok();
+    let results = if let Ok(Some((tag, member))) =
+        store.member_ref_at(&file_path, pos.line, pos.character)
+    {
+        let scoped = store.find_member_definition(&tag, &member).unwrap_or_default();
+        if scoped.is_empty() {
+            store.find_definitions(&word).ok()
+        } else {
+            Some(scoped)
+        }
+    } else {
+        store.find_definitions(&word).ok()
+    };
     if let Some(results) = results {
         if let Some(r) = results.first() {
             let mut md = format!(
