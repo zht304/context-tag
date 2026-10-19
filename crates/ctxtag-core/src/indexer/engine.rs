@@ -480,21 +480,43 @@ pub(super) fn resolve_references_with_map(
 ) -> Vec<Reference> {
     let mut references: Vec<Reference> = Vec::new();
     let root = tree.root_node();
-    // Build a per-file variable -> struct-tag map so member accesses can be
-    // qualified by their receiver's type (e.g. `timer->posted` where `timer`
-    // is `struct omap_dm_timer *` becomes `omap_dm_timer::posted`). Per-file
-    // typedefs win; global typedefs fill in aliases defined in other files.
+    // Build a per-file typedef map (global typedefs fill in aliases defined in
+    // other files) and a file-scope variable-type map for globals. Function
+    // locals are collected per function during the walk so a name reused with a
+    // different type in another function can't poison this one.
     let mut typedefs = collect_typedefs(tree);
     for (alias, tag) in &global.typedef_to_tag {
         typedefs.entry(alias.clone()).or_insert_with(|| tag.clone());
     }
-    let var_types = collect_var_types(tree, &typedefs);
-    let no_locals: HashSet<String> = HashSet::new();
+    let file_vars = collect_var_types_subtree(root, tree, &typedefs, true);
+    let empty_locals: HashMap<String, Option<String>> = HashMap::new();
+    let vars = VarTypes { file: &file_vars, local: &empty_locals };
     walk_refs_node(
-        root, tree, scopes, symbol_map, &var_types, &typedefs, global, &no_locals, None,
-        &mut references,
+        root, tree, scopes, symbol_map, &vars, &typedefs, global, None, &mut references,
     );
     references
+}
+
+/// Two-level variable-type view: file-scope globals plus the current function's
+/// locals/parameters. A function local shadows a file-scope name of the same
+/// identifier. Values are the resolved struct tag, or `None` when the name's
+/// type isn't a struct or is ambiguous within its scope.
+struct VarTypes<'a> {
+    file: &'a HashMap<String, Option<String>>,
+    local: &'a HashMap<String, Option<String>>,
+}
+
+impl<'a> VarTypes<'a> {
+    fn tag_of(&self, name: &str) -> Option<String> {
+        match self.local.get(name) {
+            Some(v) => v.clone(),
+            None => self.file.get(name).and_then(|v| v.clone()),
+        }
+    }
+
+    fn is_local(&self, name: &str) -> bool {
+        self.local.contains_key(name)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -503,12 +525,9 @@ fn walk_refs_node(
     tree: &SourceTree,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
-    var_types: &HashMap<String, Option<String>>,
+    vars: &VarTypes,
     typedefs: &HashMap<String, String>,
     global: &GlobalTypes,
-    // Names bound as locals/parameters of the enclosing function. References to
-    // a name in this set that is not also a global are pure-local and skipped.
-    locals: &HashSet<String>,
     // Struct tag of the aggregate currently being brace-initialized, so
     // designated initializers (`.field = value`) can be qualified.
     init_tag: Option<&str>,
@@ -517,19 +536,20 @@ fn walk_refs_node(
     match node.kind() {
         "function_definition" => {
             // C/C++ functions don't nest, so the whole subtree shares one local
-            // set computed from the parameters and body declarations.
-            let fn_locals = collect_function_locals(node, tree);
+            // type/scope map built from this function's parameters and body
+            // declarations, layered over the file-scope globals.
+            let fn_locals = collect_var_types_subtree(node, tree, typedefs, false);
+            let fvars = VarTypes { file: vars.file, local: &fn_locals };
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 walk_refs_node(
-                    child, tree, scopes, symbol_map, var_types, typedefs, global, &fn_locals,
-                    init_tag, refs,
+                    child, tree, scopes, symbol_map, &fvars, typedefs, global, init_tag, refs,
                 );
             }
             return;
         }
         "identifier" => {
-            resolve_ref_id(node, tree, scopes, symbol_map, locals, &global.global_names, refs);
+            resolve_ref_id(node, tree, scopes, symbol_map, vars, &global.global_names, refs);
             return;
         }
         "call_expression" => {
@@ -540,7 +560,7 @@ fn walk_refs_node(
             let func = node.child_by_field_name("function");
             let plain_callee = func.map(|f| f.kind() == "identifier").unwrap_or(false);
             if plain_callee {
-                resolve_ref_call(node, tree, scopes, symbol_map, locals, &global.global_names, refs);
+                resolve_ref_call(node, tree, scopes, symbol_map, vars, &global.global_names, refs);
             }
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
@@ -548,7 +568,7 @@ fn walk_refs_node(
                     continue;
                 }
                 walk_refs_node(
-                    child, tree, scopes, symbol_map, var_types, typedefs, global, locals, None, refs,
+                    child, tree, scopes, symbol_map, vars, typedefs, global, None, refs,
                 );
             }
             return;
@@ -558,8 +578,7 @@ fn walk_refs_node(
         }
         "field_expression" => {
             resolve_ref_field(
-                node, tree, scopes, symbol_map, var_types, &global.field_type, locals,
-                &global.global_names, refs,
+                node, tree, scopes, symbol_map, vars, &global.field_type, &global.global_names, refs,
             );
         }
         "initializer_list" => {
@@ -569,8 +588,7 @@ fn walk_refs_node(
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 walk_refs_node(
-                    child, tree, scopes, symbol_map, var_types, typedefs, global, locals,
-                    tag.as_deref(), refs,
+                    child, tree, scopes, symbol_map, vars, typedefs, global, tag.as_deref(), refs,
                 );
             }
             return;
@@ -579,7 +597,7 @@ fn walk_refs_node(
             resolve_ref_init_pair(node, tree, init_tag, refs);
             if let Some(value) = node.child_by_field_name("value") {
                 walk_refs_node(
-                    value, tree, scopes, symbol_map, var_types, typedefs, global, locals, None, refs,
+                    value, tree, scopes, symbol_map, vars, typedefs, global, None, refs,
                 );
             }
             return;
@@ -590,31 +608,9 @@ fn walk_refs_node(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         walk_refs_node(
-            child, tree, scopes, symbol_map, var_types, typedefs, global, locals, init_tag, refs,
+            child, tree, scopes, symbol_map, vars, typedefs, global, init_tag, refs,
         );
     }
-}
-
-/// Collect the local variable and parameter names declared anywhere within a
-/// function body, used to drop references that can only denote a local.
-fn collect_function_locals(fn_node: tree_sitter::Node, tree: &SourceTree) -> HashSet<String> {
-    let mut set = HashSet::new();
-    fn walk(node: tree_sitter::Node, tree: &SourceTree, set: &mut HashSet<String>) {
-        if matches!(node.kind(), "declaration" | "parameter_declaration") {
-            let mut cursor = node.walk();
-            for d in node.children_by_field_name("declarator", &mut cursor) {
-                if let Some(name) = declarator_var_name(d, tree) {
-                    set.insert(name);
-                }
-            }
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            walk(child, tree, set);
-        }
-    }
-    walk(fn_node, tree, &mut set);
-    set
 }
 
 /// Resolve the struct tag of the aggregate an `initializer_list` initializes by
@@ -687,7 +683,7 @@ fn resolve_ref_id(
     tree: &SourceTree,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
-    locals: &HashSet<String>,
+    vars: &VarTypes,
     global_names: &HashSet<String>,
     refs: &mut Vec<Reference>,
 ) {
@@ -701,7 +697,7 @@ fn resolve_ref_id(
     }
     // A pure local (bound in the enclosing function, no global of the same name)
     // is not stored: it can't be queried project-wide and only bloats the DB.
-    if locals.contains(name) && !global_names.contains(name) {
+    if vars.is_local(name) && !global_names.contains(name) {
         return;
     }
     let (ref_kind, context) = classify_ref(parent.kind());
@@ -730,7 +726,7 @@ fn resolve_ref_call(
     tree: &SourceTree,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
-    locals: &HashSet<String>,
+    vars: &VarTypes,
     global_names: &HashSet<String>,
     refs: &mut Vec<Reference>,
 ) {
@@ -739,7 +735,7 @@ fn resolve_ref_call(
         None => return,
     };
     let name = tree.node_text(&function);
-    if locals.contains(name) && !global_names.contains(name) {
+    if vars.is_local(name) && !global_names.contains(name) {
         return;
     }
     let symbol_id = lookup_id(name, scopes, symbol_map);
@@ -795,9 +791,8 @@ fn resolve_ref_field(
     tree: &SourceTree,
     scopes: &[crate::model::Scope],
     symbol_map: &HashMap<String, i64>,
-    var_types: &HashMap<String, Option<String>>,
+    vars: &VarTypes,
     field_type: &HashMap<(String, String), String>,
-    locals: &HashSet<String>,
     global_names: &HashSet<String>,
     refs: &mut Vec<Reference>,
 ) {
@@ -817,7 +812,7 @@ fn resolve_ref_field(
     // global field-type table. Falls back to the bare member name.
     let recv_tag = node
         .child_by_field_name("argument")
-        .and_then(|op| receiver_type_tag(op, tree, var_types, field_type, 0));
+        .and_then(|op| receiver_type_tag(op, tree, vars, field_type, 0));
     let symbol_name = match recv_tag {
         Some(tag) => format!("{}::{}", tag, field_name),
         None => field_name.to_string(),
@@ -844,7 +839,7 @@ fn resolve_ref_field(
     });
     if let Some(operand) = node.child_by_field_name("argument") {
         if operand.kind() == "identifier" {
-            resolve_ref_id(operand, tree, scopes, symbol_map, locals, global_names, refs);
+            resolve_ref_id(operand, tree, scopes, symbol_map, vars, global_names, refs);
         }
     }
 }
@@ -902,7 +897,7 @@ fn base_type_tag(
 fn receiver_type_tag(
     operand: tree_sitter::Node,
     tree: &SourceTree,
-    var_types: &HashMap<String, Option<String>>,
+    vars: &VarTypes,
     field_type: &HashMap<(String, String), String>,
     depth: usize,
 ) -> Option<String> {
@@ -912,15 +907,15 @@ fn receiver_type_tag(
     match operand.kind() {
         "identifier" => {
             let name = tree.node_text(&operand);
-            var_types.get(name).cloned().flatten()
+            vars.tag_of(name)
         }
         "pointer_expression" | "parenthesized_expression" => operand
             .named_child(0)
-            .and_then(|c| receiver_type_tag(c, tree, var_types, field_type, depth + 1)),
+            .and_then(|c| receiver_type_tag(c, tree, vars, field_type, depth + 1)),
         "field_expression" => {
             let arg = operand.child_by_field_name("argument")?;
             let field = operand.child_by_field_name("field")?;
-            let base = receiver_type_tag(arg, tree, var_types, field_type, depth + 1)?;
+            let base = receiver_type_tag(arg, tree, vars, field_type, depth + 1)?;
             let field_name = tree.node_text(&field);
             field_type.get(&(base, field_name.to_string())).cloned()
         }
@@ -957,22 +952,33 @@ fn collect_typedefs(tree: &SourceTree) -> HashMap<String, String> {
     map
 }
 
-/// Build a per-file variable-name -> resolved-struct-tag map. A `None` value
-/// means the name is declared with a non-struct type or with conflicting types
-/// in the same file, so member accesses on it must not be qualified.
-fn collect_var_types(
+/// Build a variable-name -> resolved-struct-tag map by walking from `start`.
+/// A `None` value means the name is declared with a non-struct type or with
+/// conflicting types within the walked region, so member accesses on it must not
+/// be qualified. Only variable declarations (`declaration`,
+/// `parameter_declaration`) are considered — struct field declarations name
+/// members, not in-scope variables. When `skip_functions` is set, function
+/// bodies are not descended, so the result holds only file-scope globals;
+/// per-function locals are collected separately with `skip_functions = false`.
+fn collect_var_types_subtree(
+    start: tree_sitter::Node,
     tree: &SourceTree,
     typedefs: &HashMap<String, String>,
+    skip_functions: bool,
 ) -> HashMap<String, Option<String>> {
     let mut map: HashMap<String, Option<String>> = HashMap::new();
     fn walk(
         node: tree_sitter::Node,
         tree: &SourceTree,
         typedefs: &HashMap<String, String>,
+        skip_functions: bool,
         map: &mut HashMap<String, Option<String>>,
     ) {
+        if skip_functions && node.kind() == "function_definition" {
+            return;
+        }
         match node.kind() {
-            "declaration" | "parameter_declaration" | "field_declaration" => {
+            "declaration" | "parameter_declaration" => {
                 if let Some(ty) = node.child_by_field_name("type") {
                     let tag = base_type_tag(ty, tree, typedefs);
                     let mut cursor = node.walk();
@@ -993,10 +999,10 @@ fn collect_var_types(
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            walk(child, tree, typedefs, map);
+            walk(child, tree, typedefs, skip_functions, map);
         }
     }
-    walk(tree.root_node(), tree, typedefs, &mut map);
+    walk(start, tree, typedefs, skip_functions, &mut map);
     map
 }
 
