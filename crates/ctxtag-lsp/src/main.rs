@@ -247,6 +247,15 @@ fn handle_definition(
         );
     }
 
+    // A function-local variable or parameter resolves to its own declaration,
+    // not to a same-named global symbol.
+    if let Some(loc) = local_definition_location(&file_path, pos.line, pos.character, &word) {
+        return send_response(
+            id,
+            Ok(serde_json::to_value(GotoDefinitionResponse::Array(vec![loc]))?),
+        );
+    }
+
     let results = store.find_definitions(&word).ok();
     if let Some(results) = results {
         let locations = symbol_locations(&results);
@@ -257,6 +266,37 @@ fn handle_definition(
     }
 
     send_response(id, Ok(serde_json::json!(null)))
+}
+
+/// Resolve a function-local variable or parameter to its declaration within the
+/// enclosing function. Locals aren't stored as symbols, so a plain name lookup
+/// would wrongly jump to an unrelated global that shares the name (e.g. a local
+/// `attribute` matching `struct attribute`). Returns `None` when the identifier
+/// isn't a function-local, letting the caller fall back to the symbol table.
+fn local_definition_location(
+    file_path: &str,
+    line: u32,
+    col: u32,
+    word: &str,
+) -> Option<Location> {
+    use ctxtag_core::parser::{find_local_declaration, LanguageKind};
+    let path = std::path::Path::new(file_path);
+    let language = LanguageKind::from_path(path)?;
+    let source = std::fs::read(path).ok()?;
+    let decl = find_local_declaration(&source, language, line, col, word)?;
+    Some(Location {
+        uri: url_from_path(file_path),
+        range: Range {
+            start: Position {
+                line: decl.line_start,
+                character: decl.col_start,
+            },
+            end: Position {
+                line: decl.line_end,
+                character: decl.col_end,
+            },
+        },
+    })
 }
 
 /// Map query results to LSP locations.
