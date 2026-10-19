@@ -258,6 +258,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "ctxtag-core",
+ "libc",
  "lsp-server",
  "lsp-types",
  "notify",

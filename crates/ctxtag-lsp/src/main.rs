@@ -32,7 +32,31 @@ impl BackendState {
     }
 }
 
+/// Ask the kernel to SIGTERM this process when its parent (the editor's LSP
+/// client) exits. Without it, a window close/reload that abandons the server
+/// while leaving its stdio socket open leaks the process forever — the reader
+/// never sees EOF and no `shutdown` arrives. Linux-only; a no-op elsewhere.
+#[cfg(target_os = "linux")]
+fn install_parent_death_signal() {
+    unsafe {
+        let parent = libc::getppid();
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
+        // Race guard: if the parent died between exec and the prctl above, we've
+        // already been reparented, so PDEATHSIG will never fire — exit now
+        // instead of running orphaned.
+        if libc::getppid() != parent {
+            std::process::exit(0);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_parent_death_signal() {}
+
 fn main() -> anyhow::Result<()> {
+    // Arm the parent-death guard first, before anything else can delay it.
+    install_parent_death_signal();
+
     // Logs MUST go to stderr: stdout is the LSP JSON-RPC channel and any stray
     // bytes there corrupt the Content-Length framing.
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
