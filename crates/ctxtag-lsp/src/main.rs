@@ -161,8 +161,15 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    io_threads.join()?;
-    Ok(())
+    // The session ended (client sent `exit`, or stdin closed). Do NOT call
+    // io_threads.join(): the writer thread only finishes once every clone of
+    // the outgoing Sender drops, but SENDER is a process-global (OnceLock) that
+    // can never drop. join() would therefore block forever, the process would
+    // never terminate, and the editor's client.stop()/deactivate() would hang —
+    // leaving this ctx-lsp alive after a window reload. The reader thread has
+    // already flushed the shutdown response, so terminate directly.
+    drop(io_threads);
+    std::process::exit(0);
 }
 
 fn send_response(
