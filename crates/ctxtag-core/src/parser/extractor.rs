@@ -470,14 +470,13 @@ impl SymbolExtractor {
         if !display_name.is_empty() {
             self.container_stack.push(display_name.clone());
 
-            if let Some(body_node) = body {
-                let enumerator_list = body_node.child_by_field_name("body");
-                if let Some(enum_list) = enumerator_list {
-                    let mut cursor = enum_list.walk();
-                    for child in enum_list.named_children(&mut cursor) {
-                        if child.kind() == "enumerator" {
-                            self.extract_enumerator(child, display_name.clone(), tree);
-                        }
+            // `body` IS the enumerator_list; iterate its `enumerator` children
+            // directly (it has no nested `body` field).
+            if let Some(enum_list) = body {
+                let mut cursor = enum_list.walk();
+                for child in enum_list.named_children(&mut cursor) {
+                    if child.kind() == "enumerator" {
+                        self.extract_enumerator(child, display_name.clone(), tree);
                     }
                 }
             }
