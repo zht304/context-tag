@@ -14,8 +14,8 @@ pub struct IndexArgs {
     /// Comma-separated file extensions
     #[arg(short, long, default_value = "c,h,cpp,cxx,cc,hpp,hxx,hh")]
     pub ext: String,
-    /// Comma-separated exclude patterns
-    #[arg(short = 'x', long, default_value = "vendor,build,target,.git,node_modules")]
+    /// Comma-separated exclude patterns (matched as path substrings)
+    #[arg(short = 'x', long, default_value = ".git,.svn,.hg,.cache")]
     pub exclude: String,
     /// Use bulk indexing mode (deferred index creation, ~1.7x faster)
     #[arg(long)]

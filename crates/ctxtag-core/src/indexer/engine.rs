@@ -61,8 +61,7 @@ impl Default for IndexConfig {
                 "hpp".into(), "hxx".into(), "hh".into(),
             ],
             exclude_patterns: vec![
-                "vendor".into(), "build".into(), "target".into(),
-                ".git".into(), "node_modules".into(),
+                ".git".into(), ".svn".into(), ".hg".into(), ".cache".into(),
             ],
             bulk_mode: false,
         }
