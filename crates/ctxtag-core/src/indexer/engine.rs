@@ -21,6 +21,31 @@ use super::incremental::IncrementalIndexer;
 /// from one tree walk).
 const CHUNK: usize = 128;
 
+/// Worker-thread stack size for indexing. Our recursive AST walkers (symbol
+/// extraction, reference resolution) recurse once per nesting level, and deeply
+/// nested C/C++ — long initializer lists, chained arithmetic in DSP code — can
+/// recurse thousands of levels deep. The default ~2 MiB rayon stack overflows
+/// and aborts the whole process. Stacks are reserved lazily, so this costs
+/// virtual address space, not resident memory.
+const INDEX_STACK_SIZE: usize = 128 * 1024 * 1024;
+
+/// Build the global rayon pool with large worker stacks. Only the first call
+/// takes effect; later calls (or a pool already built elsewhere) are ignored.
+pub(crate) fn ensure_index_thread_pool() {
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(INDEX_STACK_SIZE)
+        .build_global();
+}
+
+/// Read a source file as text, replacing any non-UTF-8 byte with U+FFFD instead
+/// of failing. tree-sitter parses the bytes, and symbol names are ASCII, so a
+/// lossy decode keeps files with Latin-1 comments or stray bytes indexable
+/// rather than skipping them entirely.
+pub(crate) fn read_text_lossy(path: &str) -> std::io::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// Everything extracted from one file in a single parse (pass 1). References
 /// are resolved separately in pass 2 once the global type tables are complete.
 struct FileData {
@@ -86,6 +111,7 @@ impl IndexEngine {
     }
 
     pub fn index(&mut self) -> anyhow::Result<IndexStats> {
+        ensure_index_thread_pool();
         let files = self.discover_files();
         let total = files.len();
         let mut stats = IndexStats::default();
@@ -222,7 +248,7 @@ impl IndexEngine {
     fn parse_file(path: &str) -> Option<FileData> {
         let mut parser = Parser::new();
         Self::init_parser(&mut parser, path).ok()?;
-        let content = match fs::read_to_string(path) {
+        let content = match read_text_lossy(path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("Failed to read {}: {}", path, e);
@@ -278,7 +304,7 @@ impl IndexEngine {
     fn resolve_refs_for_file(path: &str, global: &GlobalTypes) -> Option<Vec<Reference>> {
         let mut parser = Parser::new();
         Self::init_parser(&mut parser, path).ok()?;
-        let content = match fs::read_to_string(path) {
+        let content = match read_text_lossy(path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("Failed to read {}: {}", path, e);
@@ -365,7 +391,7 @@ pub fn discover_source_files(
     let mut files: Vec<String> = Vec::new();
 
     if let Some(list_path) = file_list {
-        if let Ok(content) = fs::read_to_string(list_path) {
+        if let Ok(content) = read_text_lossy(list_path) {
             for line in content.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {

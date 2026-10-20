@@ -7,7 +7,10 @@ use crate::parser::{
     CallGraph, IncludeTracker, LanguageKind, MacroTracker, ScopeBuilder,
     SourceTree, SymbolExtractor,
 };
-use super::engine::{GlobalTypes, IndexStats, discover_source_files, resolve_references_with_map};
+use super::engine::{
+    GlobalTypes, IndexStats, discover_source_files, ensure_index_thread_pool, read_text_lossy,
+    resolve_references_with_map,
+};
 use super::include_resolver::IncludeResolver;
 
 /// Incremental indexer: detects changed/new/deleted files and re-indexes only those.
@@ -37,6 +40,7 @@ impl<'a> IncrementalIndexer<'a> {
     }
 
     pub fn update(&mut self) -> anyhow::Result<IndexStats> {
+        ensure_index_thread_pool();
         let mut stats = IndexStats::default();
 
         // Merge the roots already registered in this DB with any roots passed
@@ -89,7 +93,7 @@ impl<'a> IncrementalIndexer<'a> {
             match self.store.file_hash(path) {
                 Ok(Some(old_hash)) => {
                     // File exists in DB, check if content changed
-                    match fs::read_to_string(path) {
+                    match read_text_lossy(path) {
                         Ok(content) => {
                             let new_hash = self.compute_hash(&content);
                             if old_hash != new_hash {
@@ -246,7 +250,7 @@ impl<'a> IncrementalIndexer<'a> {
         &self,
         file_path: &str,
     ) -> anyhow::Result<(String, LanguageKind, Vec<crate::model::Symbol>, Vec<crate::model::Macro>, Vec<crate::model::Include>)> {
-        let content = fs::read_to_string(file_path)?;
+        let content = read_text_lossy(file_path)?;
         let content_bytes = content.as_bytes();
 
         let language = Self::detect_language(file_path);
@@ -272,7 +276,7 @@ impl<'a> IncrementalIndexer<'a> {
         &self,
         file_path: &str,
     ) -> anyhow::Result<(Vec<crate::model::Reference>, Vec<(String, String, String, u32, u32)>)> {
-        let content = fs::read_to_string(file_path)?;
+        let content = read_text_lossy(file_path)?;
         let content_bytes = content.as_bytes();
 
         let language = Self::detect_language(file_path);
