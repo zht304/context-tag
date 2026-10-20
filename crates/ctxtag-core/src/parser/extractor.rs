@@ -78,11 +78,16 @@ impl SymbolExtractor {
             _ => {}
         }
 
-        // Recurse into children for any remaining patterns
-        let mut child = node.child(0);
-        while let Some(c) = child {
-            self.walk_node(c, tree);
-            child = c.next_sibling();
+        // Recurse into named children via a cursor. Cursor sibling-steps are
+        // O(1) amortized, whereas child(0)/next_sibling() re-derives the parent
+        // on every step (ts_node_child_containing_descendant) and degrades to
+        // O(children^2) on nodes with huge child lists — e.g. the translation
+        // unit of generated register headers with tens of thousands of top-level
+        // declarations. Anonymous children are tokens that never match the cases
+        // above, so skipping them (named_children) is both safe and cheaper.
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.walk_node(child, tree);
         }
     }
 
