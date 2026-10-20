@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -37,7 +36,13 @@ struct FileData {
 /// Configuration for indexing.
 #[derive(Debug, Clone)]
 pub struct IndexConfig {
-    pub root_dir: String,
+    /// One or more project roots to walk. All are merged into a single index.
+    pub root_dirs: Vec<String>,
+    /// Optional path to a file listing source paths (one per line, `#` comments
+    /// and blanks ignored) — e.g. the output of `find`. When set, this list is
+    /// authoritative and the roots are not walked; ext/exclude filters are not
+    /// applied to explicitly-listed files.
+    pub file_list: Option<String>,
     pub db_path: String,
     pub extensions: Vec<String>,
     pub exclude_patterns: Vec<String>,
@@ -48,7 +53,8 @@ pub struct IndexConfig {
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
-            root_dir: ".".into(),
+            root_dirs: vec![".".into()],
+            file_list: None,
             db_path: ".ctxtag.db".into(),
             extensions: vec![
                 "c".into(), "h".into(), "cpp".into(), "cxx".into(), "cc".into(),
@@ -76,7 +82,7 @@ impl IndexEngine {
         } else {
             DbStore::new(&config.db_path)?
         };
-        let include_resolver = IncludeResolver::new(&config.root_dir);
+        let include_resolver = IncludeResolver::new(config.root_dirs.clone());
         Ok(Self { config, store, include_resolver })
     }
 
@@ -305,42 +311,91 @@ impl IndexEngine {
     }
 
     pub fn discover_files(&self) -> Vec<String> {
-        let mut files = Vec::new();
-        let root = Path::new(&self.config.root_dir);
-        for entry in WalkDir::new(root).follow_links(false).into_iter() {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if !self.config.extensions.contains(&ext.to_string()) {
-                continue;
-            }
-            let path_str = path.to_string_lossy().to_string();
-            if self.config.exclude_patterns.iter().any(|p| path_str.contains(p)) {
-                continue;
-            }
-            if let Ok(abs) = fs::canonicalize(path) {
-                files.push(abs.to_string_lossy().to_string());
-            }
-        }
-        files.sort();
-        files
+        discover_source_files(
+            &self.config.root_dirs,
+            self.config.file_list.as_deref(),
+            &self.config.extensions,
+            &self.config.exclude_patterns,
+        )
     }
 
     pub fn update(&mut self) -> anyhow::Result<IndexStats> {
         let mut incremental = IncrementalIndexer::new(
-            &self.config.root_dir,
+            self.config.root_dirs.clone(),
+            self.config.file_list.clone(),
             &mut self.store,
             self.config.extensions.clone(),
             self.config.exclude_patterns.clone(),
         );
         incremental.update()
     }
+}
+
+/// Discover the source files to index.
+///
+/// When `file_list` is `Some(path)`, that file is authoritative: each non-empty
+/// line not starting with `#` is a path (relative paths resolve against the
+/// cwd), canonicalized and kept only if it is an existing file. Extension and
+/// exclude filters are intentionally NOT applied to an explicit list — the
+/// caller already curated it (e.g. via `find`).
+///
+/// Otherwise every root in `root_dirs` is walked, keeping files whose extension
+/// is in `extensions` and whose path contains none of `exclude_patterns`.
+///
+/// The result is deduplicated (roots may overlap) and sorted for determinism.
+pub fn discover_source_files(
+    root_dirs: &[String],
+    file_list: Option<&str>,
+    extensions: &[String],
+    exclude_patterns: &[String],
+) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+
+    if let Some(list_path) = file_list {
+        if let Ok(content) = fs::read_to_string(list_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Ok(abs) = fs::canonicalize(line) {
+                    if abs.is_file() {
+                        files.push(abs.to_string_lossy().to_string());
+                    }
+                }
+            }
+        } else {
+            tracing::error!("Cannot read file list: {}", list_path);
+        }
+    } else {
+        for root in root_dirs {
+            for entry in WalkDir::new(root).follow_links(false).into_iter() {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                if !extensions.contains(&ext.to_string()) {
+                    continue;
+                }
+                let path_str = path.to_string_lossy().to_string();
+                if exclude_patterns.iter().any(|p| path_str.contains(p)) {
+                    continue;
+                }
+                if let Ok(abs) = fs::canonicalize(path) {
+                    files.push(abs.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    files.sort();
+    files.dedup();
+    files
 }
 
 #[derive(Debug, Default, serde::Serialize)]

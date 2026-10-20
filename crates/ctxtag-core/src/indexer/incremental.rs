@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::db::DbStore;
@@ -8,12 +7,13 @@ use crate::parser::{
     CallGraph, IncludeTracker, LanguageKind, MacroTracker, ScopeBuilder,
     SourceTree, SymbolExtractor,
 };
-use super::engine::{GlobalTypes, IndexStats, resolve_references_with_map};
+use super::engine::{GlobalTypes, IndexStats, discover_source_files, resolve_references_with_map};
 use super::include_resolver::IncludeResolver;
 
 /// Incremental indexer: detects changed/new/deleted files and re-indexes only those.
 pub struct IncrementalIndexer<'a> {
-    root_dir: String,
+    root_dirs: Vec<String>,
+    file_list: Option<String>,
     store: &'a mut DbStore,
     extensions: Vec<String>,
     exclude_patterns: Vec<String>,
@@ -21,13 +21,15 @@ pub struct IncrementalIndexer<'a> {
 
 impl<'a> IncrementalIndexer<'a> {
     pub fn new(
-        root_dir: &str,
+        root_dirs: Vec<String>,
+        file_list: Option<String>,
         store: &'a mut DbStore,
         extensions: Vec<String>,
         exclude_patterns: Vec<String>,
     ) -> Self {
         Self {
-            root_dir: root_dir.to_string(),
+            root_dirs,
+            file_list,
             store,
             extensions,
             exclude_patterns,
@@ -157,7 +159,7 @@ impl<'a> IncrementalIndexer<'a> {
         // full on-disk file set and the full DB file map so cross-file targets
         // that were not re-indexed still link up.
         if !inc_batch.is_empty() {
-            let mut resolver = IncludeResolver::new(&self.root_dir);
+            let mut resolver = IncludeResolver::new(self.root_dirs.clone());
             let resolved = resolver.resolve_all(&inc_batch, &disk_files);
             let full_map = self.store.load_file_map()?;
             stats.includes_resolved = self.store.batch_insert_includes(&resolved, &full_map)?;
@@ -198,46 +200,14 @@ impl<'a> IncrementalIndexer<'a> {
         Ok(stats)
     }
 
-    /// Discover C/C++ source files on disk (same logic as IndexEngine::discover_files).
+    /// Discover source files on disk (shared logic with IndexEngine).
     fn discover_files(&self) -> Vec<String> {
-        let mut files = Vec::new();
-        let root = Path::new(&self.root_dir);
-
-        for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter() {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if !self.extensions.contains(&ext.to_string()) {
-                continue;
-            }
-
-            let path_str = path.to_string_lossy().to_string();
-            let mut excluded = false;
-            for pattern in &self.exclude_patterns {
-                if path_str.contains(pattern) {
-                    excluded = true;
-                    break;
-                }
-            }
-            if excluded {
-                continue;
-            }
-
-            if let Ok(abs) = fs::canonicalize(path) {
-                files.push(abs.to_string_lossy().to_string());
-            }
-        }
-
-        files.sort();
-        files
+        discover_source_files(
+            &self.root_dirs,
+            self.file_list.as_deref(),
+            &self.extensions,
+            &self.exclude_patterns,
+        )
     }
 
     fn compute_hash(&self, content: &str) -> String {

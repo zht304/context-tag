@@ -5,15 +5,15 @@ use crate::model::Include;
 
 /// Resolves #include paths to actual file paths without compile_commands.json.
 pub struct IncludeResolver {
-    root_dir: String,
+    root_dirs: Vec<String>,
     /// Cache: include_text -> resolved_path
     cache: std::collections::HashMap<(String, String), String>,
 }
 
 impl IncludeResolver {
-    pub fn new(root_dir: &str) -> Self {
+    pub fn new(root_dirs: Vec<String>) -> Self {
         Self {
-            root_dir: root_dir.to_string(),
+            root_dirs,
             cache: std::collections::HashMap::new(),
         }
     }
@@ -63,17 +63,15 @@ impl IncludeResolver {
             }
         }
 
-        // Strategy 2: Common subdirectories
+        // Strategy 2: Common subdirectories, under every root.
         let common_subdirs = ["", "include", "includes", "src", "lib", "libs", "headers", "inc"];
-        for subdir in &common_subdirs {
-            if subdir.is_empty() {
-                let candidate = format!("{}/{}", self.root_dir, include_text);
-                if Path::new(&candidate).exists() {
-                    self.cache.insert(cache_key, candidate.clone());
-                    return Some(candidate);
-                }
-            } else {
-                let candidate = format!("{}/{}/{}", self.root_dir, subdir, include_text);
+        for root in &self.root_dirs {
+            for subdir in &common_subdirs {
+                let candidate = if subdir.is_empty() {
+                    format!("{}/{}", root, include_text)
+                } else {
+                    format!("{}/{}/{}", root, subdir, include_text)
+                };
                 if Path::new(&candidate).exists() {
                     self.cache.insert(cache_key, candidate.clone());
                     return Some(candidate);
