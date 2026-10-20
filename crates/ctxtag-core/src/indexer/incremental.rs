@@ -39,6 +39,31 @@ impl<'a> IncrementalIndexer<'a> {
     pub fn update(&mut self) -> anyhow::Result<IndexStats> {
         let mut stats = IndexStats::default();
 
+        // Merge the roots already registered in this DB with any roots passed
+        // on this invocation, so `update <newdir>` ADDS a root rather than
+        // treating every file under the previously-indexed roots as deleted.
+        // Skipped in file-list mode, where the list is authoritative.
+        if self.file_list.is_none() {
+            let mut union: Vec<String> = self.store.load_roots()?;
+            for r in &self.root_dirs {
+                if let Ok(abs) = fs::canonicalize(r) {
+                    let s = abs.to_string_lossy().to_string();
+                    if !union.contains(&s) {
+                        union.push(s);
+                    }
+                }
+            }
+            if union.is_empty() {
+                tracing::warn!(
+                    "update: no roots registered in this DB and none given; nothing to do"
+                );
+                return Ok(stats);
+            }
+            union.sort();
+            self.store.register_roots(&union)?;
+            self.root_dirs = union;
+        }
+
         // 1. Discover current source files on disk
         let disk_files = self.discover_files();
         let disk_paths: std::collections::HashSet<_> = disk_files.iter().cloned().collect();

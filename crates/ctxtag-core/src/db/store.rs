@@ -238,6 +238,34 @@ impl DbStore {
         Ok(map)
     }
 
+    /// Record project roots belonging to this database. Idempotent; used so a
+    /// later `update` can discover the full registered root set (and only treat
+    /// a file as deleted when it is missing from every root).
+    pub fn register_roots(&mut self, roots: &[String]) -> anyhow::Result<()> {
+        if roots.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut ins = tx.prepare_cached("INSERT OR IGNORE INTO roots (path) VALUES (?)")?;
+            for r in roots {
+                ins.execute(params![r])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_roots(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM roots ORDER BY path")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn load_symbol_map(&self) -> anyhow::Result<HashMap<String, i64>> {
         let mut stmt = self
             .conn

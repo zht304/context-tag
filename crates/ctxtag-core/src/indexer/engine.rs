@@ -92,6 +92,20 @@ impl IndexEngine {
         let mut stats = IndexStats::default();
         let start = Instant::now();
 
+        // Record the roots this DB covers so a later `update` can rediscover
+        // the full set (and add new roots) instead of purging the others.
+        // Skipped in file-list mode, where the list — not roots — is authoritative.
+        if self.config.file_list.is_none() {
+            let canon: Vec<String> = self
+                .config
+                .root_dirs
+                .iter()
+                .filter_map(|r| fs::canonicalize(r).ok())
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            self.store.register_roots(&canon)?;
+        }
+
         if self.config.bulk_mode {
             // Fresh DB in bulk mode: start clean and defer indexes.
             let _ = self.store.drop_indexes();

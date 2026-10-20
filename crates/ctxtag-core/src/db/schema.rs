@@ -91,6 +91,9 @@ pub const TABLES: &[&str] = &[
         flags INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (derived_id, base_id)
     );"#,
+    r#"CREATE TABLE IF NOT EXISTS roots (
+        path TEXT PRIMARY KEY
+    );"#,
     r#"CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
         name
     );"#,

@@ -58,8 +58,11 @@ pub fn cmd_index(args: IndexArgs, db_path: &str) -> anyhow::Result<()> {
 }
 
 pub fn cmd_update(args: UpdateArgs, db_path: &str) -> anyhow::Result<()> {
+    // Unlike `index`, an empty roots list must NOT default to "." — that would
+    // register the cwd as a root and pull unrelated files in. Empty means "use
+    // the roots already registered in this database".
     let config = IndexConfig {
-        root_dirs: resolve_roots(args.roots),
+        root_dirs: args.roots,
         file_list: args.file_list,
         db_path: db_path.to_string(),
         ..Default::default()
