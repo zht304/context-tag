@@ -20,6 +20,10 @@ pub struct IndexArgs {
     /// Use bulk indexing mode (deferred index creation, ~1.7x faster)
     #[arg(long)]
     pub bulk: bool,
+    /// Report the slowest files per pass (per-file parse/resolve wall time),
+    /// to locate pathologically slow inputs.
+    #[arg(long)]
+    pub timing: bool,
 }
 
 #[derive(Parser)]
@@ -48,6 +52,7 @@ pub fn cmd_index(args: IndexArgs, db_path: &str) -> anyhow::Result<()> {
         extensions: args.ext.split(',').map(|s| s.trim().to_string()).collect(),
         exclude_patterns: args.exclude.split(',').map(|s| s.trim().to_string()).collect(),
         bulk_mode: args.bulk,
+        timing: args.timing,
     };
 
     let mut engine = IndexEngine::new(config)?;

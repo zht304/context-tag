@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -73,6 +74,9 @@ pub struct IndexConfig {
     pub exclude_patterns: Vec<String>,
     /// Bulk mode defers index creation and uses aggressive SQLite pragmas.
     pub bulk_mode: bool,
+    /// When true, measure per-file wall time in both passes and report the
+    /// slowest files at the end, to locate pathologically slow inputs.
+    pub timing: bool,
 }
 
 impl Default for IndexConfig {
@@ -89,6 +93,7 @@ impl Default for IndexConfig {
                 ".git".into(), ".svn".into(), ".hg".into(), ".cache".into(),
             ],
             bulk_mode: false,
+            timing: false,
         }
     }
 }
@@ -142,12 +147,29 @@ impl IndexEngine {
         let threads = rayon::current_num_threads();
         tracing::info!("Indexing {} files ({} threads, two passes)", total, threads);
 
+        // Per-file wall-time sinks, populated only when `timing` is on. Shared
+        // across rayon workers; the lock is held for one push per file, which
+        // is negligible next to the parse/resolve it measures.
+        let timing = self.config.timing;
+        let t_pass1: Arc<Mutex<Vec<(String, u128)>>> = Arc::new(Mutex::new(Vec::new()));
+        let t_pass2: Arc<Mutex<Vec<(String, u128)>>> = Arc::new(Mutex::new(Vec::new()));
+
         // ---- Pass 1: symbols, macros, includes, call edges. Accumulate the
         // cross-file type tables that pass 2 needs to qualify member refs. ----
         for (ci, chunk) in files.chunks(CHUNK).enumerate() {
             let data: Vec<FileData> = chunk
                 .par_iter()
-                .filter_map(|p| Self::parse_file(p))
+                .filter_map(|p| {
+                    let t0 = Instant::now();
+                    let r = Self::parse_file(p);
+                    if timing {
+                        t_pass1
+                            .lock()
+                            .unwrap()
+                            .push((p.clone(), t0.elapsed().as_micros()));
+                    }
+                    r
+                })
                 .collect();
 
             // Register files (hash computed from in-memory content, no clone).
@@ -214,7 +236,17 @@ impl IndexEngine {
         for (ci, chunk) in files.chunks(CHUNK).enumerate() {
             let refs: Vec<Reference> = chunk
                 .par_iter()
-                .filter_map(|p| Self::resolve_refs_for_file(p, &global))
+                .filter_map(|p| {
+                    let t0 = Instant::now();
+                    let r = Self::resolve_refs_for_file(p, &global);
+                    if timing {
+                        t_pass2
+                            .lock()
+                            .unwrap()
+                            .push((p.clone(), t0.elapsed().as_micros()));
+                    }
+                    r
+                })
                 .flatten()
                 .collect();
             stats.references_resolved += self.store.batch_insert_references(&refs, &global_map)?;
@@ -236,12 +268,40 @@ impl IndexEngine {
             tracing::info!("Indexes built in {:.1}s", idx_start.elapsed().as_secs_f32());
         }
 
+        if timing {
+            Self::report_timing("pass1 parse+extract", &t_pass1.lock().unwrap(), 30);
+            Self::report_timing("pass2 re-parse+resolve", &t_pass2.lock().unwrap(), 30);
+        }
+
         tracing::info!(
             "Indexing complete in {:.1}s: {:?}",
             start.elapsed().as_secs_f32(),
             stats
         );
         Ok(stats)
+    }
+
+    /// Print the `top_n` slowest files (by measured wall time) for one pass,
+    /// plus the pass total and mean. Times are per-file CPU spent in the rayon
+    /// worker, so the total is the sum across threads, not wall clock.
+    fn report_timing(label: &str, samples: &[(String, u128)], top_n: usize) {
+        if samples.is_empty() {
+            return;
+        }
+        let mut ranked: Vec<&(String, u128)> = samples.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        let total_us: u128 = samples.iter().map(|s| s.1).sum();
+        let n = samples.len();
+        tracing::info!(
+            "== {} timing: {} files, {:.1}s total CPU, {:.1}ms mean ==",
+            label,
+            n,
+            total_us as f64 / 1e6,
+            total_us as f64 / n as f64 / 1e3
+        );
+        for (path, us) in ranked.iter().take(top_n) {
+            tracing::info!("  {:>9.1}ms  {}", *us as f64 / 1e3, path);
+        }
     }
 
     /// Parse one file exactly once, extracting all entity kinds.
