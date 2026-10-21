@@ -172,24 +172,31 @@ impl SymbolExtractor {
         // Check if this is inside a struct (i.e., a member)
         let is_member = self.is_inside_struct(node);
 
-        // Walk init_declarator children
-        let init_declarators = node.child_by_field_name("declarators");
-        if let Some(init_declarators) = init_declarators {
-            let mut cursor = init_declarators.walk();
-            for child in init_declarators.named_children(&mut cursor) {
-                if child.kind() == "init_declarator" {
-                    let declarator = child.child_by_field_name("declarator");
-                    if let Some(decl) = declarator {
-                        self.extract_variable_from_declarator(
-                            decl,
-                            decl_type_str,
-                            storage_class.clone(),
-                            is_member,
-                            tree,
-                        );
-                    }
-                }
+        // A `declaration` carries one or more declarators in the repeated
+        // `declarator` field (comma-separated: `int a, b;`). A declarator with
+        // an initializer is wrapped in an `init_declarator`; bare ones
+        // (`int x;`, `T arr[30];`, `int *p;`) are not. Unwrap init_declarator to
+        // its inner declarator for an accurate span, then let
+        // extract_declarator_name peel array/pointer/parenthesized wrappers.
+        let mut cursor = node.walk();
+        for decl in node.children_by_field_name("declarator", &mut cursor) {
+            let inner = if decl.kind() == "init_declarator" {
+                decl.child_by_field_name("declarator").unwrap_or(decl)
+            } else {
+                decl
+            };
+            // A function prototype (`int foo(int);`) declares a function, not a
+            // variable; skip it here so it isn't mislabeled as a Variable.
+            if inner.kind() == "function_declarator" {
+                continue;
             }
+            self.extract_variable_from_declarator(
+                inner,
+                decl_type_str,
+                storage_class.clone(),
+                is_member,
+                tree,
+            );
         }
     }
 
@@ -206,19 +213,19 @@ impl SymbolExtractor {
             return;
         }
 
+        // Only file-scope (global / static) variables become symbols. Function-
+        // local declarations are intentionally skipped to keep the DB compact;
+        // local jump-to-definition is resolved by scope at query time.
+        if !is_member && self.is_inside_function(declarator) {
+            return;
+        }
+
         let (adjusted_type, kind) = if is_member {
             (decl_type.to_string(), SymbolKind::Member)
+        } else if storage_class.as_deref() == Some("static") {
+            (decl_type.to_string(), SymbolKind::StaticMember)
         } else {
-            // Determine if this is a local variable or a global variable
-            let in_function = self.is_inside_function(declarator);
-            let sk = if in_function {
-                SymbolKind::LocalVariable
-            } else if storage_class.as_deref() == Some("static") {
-                SymbolKind::StaticMember
-            } else {
-                SymbolKind::Variable
-            };
-            (decl_type.to_string(), sk)
+            (decl_type.to_string(), SymbolKind::Variable)
         };
 
         let pos = declarator.start_position();
