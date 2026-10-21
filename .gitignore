@@ -1,5 +1,6 @@
 /target/
 /vendor/
+node_modules/
 **/.ctxtag.db
 *.pdb
 *.profraw
