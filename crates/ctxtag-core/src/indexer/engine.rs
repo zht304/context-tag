@@ -372,11 +372,13 @@ impl IndexEngine {
 
 /// Discover the source files to index.
 ///
-/// When `file_list` is `Some(path)`, that file is authoritative: each non-empty
-/// line not starting with `#` is a path (relative paths resolve against the
-/// cwd), canonicalized and kept only if it is an existing file. Extension and
-/// exclude filters are intentionally NOT applied to an explicit list — the
-/// caller already curated it (e.g. via `find`).
+/// When `file_list` is `Some(path)`, each non-empty line not starting with `#`
+/// is a path (relative paths resolve against the cwd), canonicalized and kept
+/// only if it is an existing file whose extension is in `extensions`. The
+/// exclude patterns are NOT applied to an explicit list — the caller already
+/// curated it (e.g. via `find`) — but the source-extension whitelist is, so
+/// build artifacts that `find` sweeps up (gcc `.P`/`.d` dependency files, etc.)
+/// are not force-parsed as C.
 ///
 /// Otherwise every root in `root_dirs` is walked, keeping files whose extension
 /// is in `extensions` and whose path contains none of `exclude_patterns`.
@@ -392,16 +394,37 @@ pub fn discover_source_files(
 
     if let Some(list_path) = file_list {
         if let Ok(content) = read_text_lossy(list_path) {
+            let mut skipped = 0usize;
             for line in content.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
                 if let Ok(abs) = fs::canonicalize(line) {
-                    if abs.is_file() {
-                        files.push(abs.to_string_lossy().to_string());
+                    if !abs.is_file() {
+                        continue;
                     }
+                    // Apply the same source-extension whitelist as directory
+                    // mode. A curated list (e.g. from `find`) often contains
+                    // build artifacts like gcc `.P`/`.d` dependency files; those
+                    // are not C/C++ source, yield zero symbols, and force-parsing
+                    // them as C produces pathological error-recovery trees that
+                    // are ~100x slower to walk and inject millions of garbage
+                    // references. Skipping them keeps the index clean and fast.
+                    let ext = abs.extension().and_then(|s| s.to_str()).unwrap_or("");
+                    if !extensions.contains(&ext.to_string()) {
+                        skipped += 1;
+                        continue;
+                    }
+                    files.push(abs.to_string_lossy().to_string());
                 }
+            }
+            if skipped > 0 {
+                tracing::info!(
+                    "file-list: skipped {} non-source entries (extension not in --ext: {})",
+                    skipped,
+                    extensions.join(",")
+                );
             }
         } else {
             tracing::error!("Cannot read file list: {}", list_path);
